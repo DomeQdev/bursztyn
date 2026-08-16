@@ -1,24 +1,15 @@
-import type { AnyTypedArray, ReaderContext, TypedArrayConstructor } from "./types.js";
-import type { StringInterner, StringReader } from "./strings.js";
-
-const INTEGER_RANGES: Record<string, [min: number, max: number]> = {
-    Int8Array: [-128, 127],
-    Uint8Array: [0, 255],
-    Uint8ClampedArray: [0, 255],
-    Int16Array: [-32768, 32767],
-    Uint16Array: [0, 65535],
-    Int32Array: [-2147483648, 2147483647],
-    Uint32Array: [0, 4294967295],
-};
+import { NumberBuffer, rangeOf, U32Buffer } from "./growable.ts";
+import type { AnyTypedArray, ReaderContext, TypedArrayConstructor } from "./types.ts";
+import type { StringInterner, StringReader } from "./strings.ts";
 
 export function assertNumericRange(
     ctor: TypedArrayConstructor,
     values: ArrayLike<number>,
     label: string,
 ): void {
-    const range = INTEGER_RANGES[ctor.name];
-    if (!range) return;
-    const [min, max] = range;
+    const [min, max] = rangeOf(ctor);
+    if (min === -Infinity) return;
+
     for (let i = 0; i < values.length; i++) {
         const v = values[i];
         if (v < min || v > max) {
@@ -84,54 +75,68 @@ export const columnsSignature = (cols: Columns): string =>
         .join(",");
 
 export class ColumnStore<C extends Columns> {
-    readonly buffers: { [K in keyof C]: number[] } = {} as any;
+    // Parallel arrays, resolved once in the constructor. `push` used to call
+    // Object.keys(this.columns) on every item, allocating a fresh string array
+    // per row written.
+    private readonly keys: string[];
+    private readonly specs: ColumnSpec[];
+    private readonly stores: (NumberBuffer | U32Buffer)[];
+    private readonly firstStride: number;
 
     constructor(
         public readonly columns: C,
         private readonly strings: StringInterner,
+        label?: string,
     ) {
-        for (const key of Object.keys(columns)) (this.buffers as any)[key] = [];
+        this.keys = Object.keys(columns);
+        this.specs = this.keys.map((key) => columns[key]);
+        this.stores = this.specs.map((spec, i) => {
+            const name = label === undefined ? this.keys[i] : `${label}.${this.keys[i]}`;
+            return spec.kind === "num" ? new NumberBuffer(spec.ctor, name) : new U32Buffer();
+        });
+
+        const first = this.specs[0];
+        this.firstStride = first !== undefined && first.kind === "num" ? first.stride : 1;
+    }
+
+    /** Live views of what has been written so far, keyed by column name. */
+    get buffers(): { readonly [K in keyof C]: AnyTypedArray } {
+        const result: Record<string, AnyTypedArray> = {};
+        for (let i = 0; i < this.keys.length; i++) result[this.keys[i]] = this.stores[i].view;
+        return result as { readonly [K in keyof C]: AnyTypedArray };
     }
 
     push(item: { [K in keyof C]: ColumnWriteValue<C[K]> }) {
-        for (const key of Object.keys(this.columns)) {
-            const spec = this.columns[key];
-            const value = (item as any)[key];
-            const buf = (this.buffers as any)[key] as number[];
+        const { keys, specs, stores } = this;
 
-            if (spec.kind === "num") {
-                if (spec.stride === 1) {
-                    buf.push(value as number);
-                } else {
-                    const arr = value as ArrayLike<number>;
-                    for (let i = 0; i < spec.stride; i++) buf.push(arr[i] ?? 0);
-                }
+        for (let i = 0; i < keys.length; i++) {
+            const spec = specs[i];
+            const value = (item as Record<string, unknown>)[keys[i]];
+
+            if (spec.kind === "stringRef") {
+                (stores[i] as U32Buffer).push(this.strings.add((value as string) ?? ""));
+                continue;
+            }
+
+            const store = stores[i] as NumberBuffer;
+            if (spec.stride === 1) {
+                store.push(value as number);
             } else {
-                buf.push(this.strings.add((value as string) ?? ""));
+                const arr = value as ArrayLike<number>;
+                store.reserve(spec.stride);
+                for (let s = 0; s < spec.stride; s++) store.push(arr[s] ?? 0);
             }
         }
     }
 
     itemCount(): number {
-        const firstKey = Object.keys(this.columns)[0];
-        if (firstKey === undefined) return 0;
-        const spec = this.columns[firstKey];
-        const len = ((this.buffers as any)[firstKey] as number[]).length;
-        return spec.kind === "num" && spec.stride !== 1 ? len / spec.stride : len;
+        if (this.stores.length === 0) return 0;
+        return this.stores[0].length / this.firstStride;
     }
 
     finalize(): AnyTypedArray[] {
-        const result: AnyTypedArray[] = [];
-        for (const key of Object.keys(this.columns)) {
-            const spec = this.columns[key];
-            const buf = (this.buffers as any)[key] as number[];
-            if (spec.kind === "num") {
-                assertNumericRange(spec.ctor, buf, key);
-                result.push(new spec.ctor(buf) as AnyTypedArray);
-            } else {
-                result.push(new Uint32Array(buf));
-            }
-        }
+        const result: AnyTypedArray[] = new Array(this.stores.length);
+        for (let i = 0; i < this.stores.length; i++) result[i] = this.stores[i].view;
         return result;
     }
 }
@@ -141,21 +146,16 @@ export const readColumns = <C extends Columns>(
     ctx: ReaderContext,
     startSectionIdx: number,
 ): { [K in keyof C]: ColumnView<C[K]> } => {
-    const result: any = {};
+    const result: Record<string, AnyTypedArray> = {};
     let i = startSectionIdx;
 
     for (const key of Object.keys(columns)) {
         const spec = columns[key];
-        if (spec.kind === "num") {
-            result[key] = ctx.view(i, spec.ctor as any);
-        } else {
-            result[key] = ctx.view(i, Uint32Array);
-        }
-
+        result[key] = spec.kind === "num" ? ctx.view(i, spec.ctor as any) : ctx.view(i, Uint32Array);
         i++;
     }
 
-    return result;
+    return result as { [K in keyof C]: ColumnView<C[K]> };
 };
 
 export const readColumnValue = <S extends ColumnSpec>(
@@ -167,10 +167,10 @@ export const readColumnValue = <S extends ColumnSpec>(
     if (spec.kind === "num") {
         if (spec.stride === 1) return view[offset] as ColumnReadValue<S>;
 
-        const out: number[] = [];
-        for (let s = 0; s < spec.stride; s++) {
-            out.push((view as any)[offset * spec.stride + s]);
-        }
+        const stride = spec.stride;
+        const out: number[] = new Array(stride);
+        const base = offset * stride;
+        for (let s = 0; s < stride; s++) out[s] = (view as AnyTypedArray)[base + s] as number;
         return out as ColumnReadValue<S>;
     }
 

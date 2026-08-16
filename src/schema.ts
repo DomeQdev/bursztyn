@@ -1,4 +1,4 @@
-import { SnapshotBuilder } from "./builder.js";
+import { SnapshotBuilder } from "./builder.ts";
 import {
     enforcement,
     isBundle,
@@ -6,8 +6,8 @@ import {
     SchemaDriftError,
     UnfinishedMigrationError,
     type MigrationBundle,
-} from "./bundle.js";
-import { BursztynError, SchemaMismatchError, type FieldDiff } from "./errors.js";
+} from "./bundle.ts";
+import { BursztynError, SchemaMismatchError, type FieldDiff } from "./errors.ts";
 import {
     createReaders,
     diffManifest,
@@ -15,8 +15,8 @@ import {
     readHeader,
     toBytes,
     type SnapshotInfo,
-} from "./format.js";
-import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
+} from "./format.ts";
+import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.ts";
 import {
     migrateSnapshot,
     resolveChain,
@@ -25,9 +25,9 @@ import {
     type MigrationReport,
     type MigrationStep,
     type MigrationTarget,
-} from "./migrate.js";
-import { STRING_TABLE_SIGNATURE } from "./strings.js";
-import type { NoInference, Readers, SchemaShape, SnapshotSource } from "./types.js";
+} from "./migrate.ts";
+import { STRING_TABLE_SIGNATURE } from "./strings.ts";
+import type { NoInference, Readers, SchemaShape, SnapshotSource } from "./types.ts";
 
 export interface SchemaDefinition<S extends SchemaShape> {
     fields: S;

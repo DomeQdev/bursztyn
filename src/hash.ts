@@ -9,11 +9,16 @@ const fmix32 = (h: number): number => {
     return h >>> 0;
 };
 
-export const hashString = (s: string): void => {
+/**
+ * Hashes `s[start..end)` into `hashState`, byte-for-byte identical to hashing
+ * the equivalent substring. Trigram indexing hashes three code units at a time;
+ * going through `substring()` allocated one throwaway string per position.
+ */
+export const hashChars = (s: string, start: number, end: number): void => {
     let h1 = 0x9747b28c | 0;
     let h2 = 0x2f2fdd8b | 0;
 
-    for (let i = 0; i < s.length; i++) {
+    for (let i = start; i < end; i++) {
         const c = s.charCodeAt(i);
 
         let k1 = Math.imul(c, 0xcc9e2d51);
@@ -31,9 +36,12 @@ export const hashString = (s: string): void => {
         h2 = (Math.imul(h2, 5) + 0x38495ab5) | 0;
     }
 
-    hashState.lo = fmix32(h1 ^ s.length);
-    hashState.hi = fmix32(((h2 ^ s.length) + h1) | 0);
+    const length = end - start;
+    hashState.lo = fmix32(h1 ^ length);
+    hashState.hi = fmix32(((h2 ^ length) + h1) | 0);
 };
+
+export const hashString = (s: string): void => hashChars(s, 0, s.length);
 
 export const splitHash = (hash: bigint): void => {
     hashState.lo = Number(hash & 0xffffffffn) >>> 0;

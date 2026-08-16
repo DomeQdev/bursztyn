@@ -1,5 +1,5 @@
-import { numColumn, stringRef, type ColumnSpec, type Columns } from "./columns.js";
-import { UnknownSignatureError } from "./errors.js";
+import { numColumn, stringRef, type ColumnSpec, type Columns } from "./columns.ts";
+import { UnknownSignatureError } from "./errors.ts";
 import {
     bucketArray,
     hashLookup,
@@ -12,9 +12,9 @@ import {
     sortedU32Index,
     stringRefArray,
     trigramIndex,
-} from "./fields.js";
-import { stringTable } from "./strings.js";
-import type { Field, TypedArrayConstructor } from "./types.js";
+} from "./fields.ts";
+import { stringTable } from "./strings.ts";
+import type { Field, TypedArrayConstructor } from "./types.ts";
 
 const TYPED_ARRAYS: Record<string, TypedArrayConstructor> = {
     Int8Array,

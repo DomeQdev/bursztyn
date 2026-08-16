@@ -1,9 +1,9 @@
-import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types.js";
-import type { AnyTypedArray } from "./types.js";
-import { hashState, hashString, hashToBigint, splitHash } from "./hash.js";
-import { StringInterner, StringReader } from "./strings.js";
+import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types.ts";
+import type { AnyTypedArray } from "./types.ts";
+import { hashChars, hashState, hashString, splitHash } from "./hash.ts";
+import { NumberBuffer, U32Buffer } from "./growable.ts";
+import { StringInterner, StringReader } from "./strings.ts";
 import {
-    assertNumericRange,
     ColumnStore,
     columnsSignature,
     readColumns,
@@ -13,27 +13,39 @@ import {
     type ColumnView,
     type ColumnReadValue,
     type ColumnWriteValue,
-} from "./columns.js";
+} from "./columns.ts";
 
 export class NumArrayBuilder {
-    public readonly values: number[] = [];
-    constructor(private ctor: TypedArrayConstructor) {}
+    private readonly buffer: NumberBuffer;
+
+    constructor(ctor: TypedArrayConstructor, label: string = ctor.name) {
+        this.buffer = new NumberBuffer(ctor, label);
+    }
+
+    /** A live view of what has been pushed. Values land in the target type directly. */
+    get values(): AnyTypedArray {
+        return this.buffer.view;
+    }
+
     push(v: number) {
-        this.values.push(v);
+        this.buffer.push(v);
     }
+
     pushMany(arr: ArrayLike<number>) {
-        for (let i = 0; i < arr.length; i++) this.values.push(arr[i]);
+        this.buffer.pushMany(arr);
     }
+
     setFrom(arr: ArrayLike<number>) {
-        this.values.length = 0;
-        this.pushMany(arr);
+        this.buffer.clear();
+        this.buffer.pushMany(arr);
     }
+
     get length() {
-        return this.values.length;
+        return this.buffer.length;
     }
-    finalize(label?: string): AnyTypedArray {
-        assertNumericRange(this.ctor, this.values, label ?? this.ctor.name);
-        return new this.ctor(this.values) as AnyTypedArray;
+
+    finalize(): AnyTypedArray {
+        return this.buffer.view;
     }
 }
 
@@ -43,11 +55,11 @@ class NumArrayField<TA extends TypedArrayConstructor> implements Field<NumArrayB
     signature() {
         return `num:${this.ctor.name}`;
     }
-    createBuilder() {
-        return new NumArrayBuilder(this.ctor);
+    createBuilder(ctx: BuilderContext) {
+        return new NumArrayBuilder(this.ctor, ctx.name ?? this.ctor.name);
     }
-    finalize(builder: NumArrayBuilder, name?: string): FieldSection[] {
-        return [{ data: builder.finalize(name) }];
+    finalize(builder: NumArrayBuilder): FieldSection[] {
+        return [{ data: builder.finalize() }];
     }
     createReader(ctx: ReaderContext): InstanceType<TA> {
         return ctx.view(0, this.ctor as any) as InstanceType<TA>;
@@ -57,7 +69,7 @@ class NumArrayField<TA extends TypedArrayConstructor> implements Field<NumArrayB
 export const numArray = <TA extends TypedArrayConstructor>(ctor: TA) => new NumArrayField(ctor);
 
 export class StringRefArrayBuilder {
-    private ids: number[] = [];
+    private readonly ids = new U32Buffer();
     constructor(private strings: StringInterner) {}
     pushString(s: string) {
         this.ids.push(this.strings.add(s));
@@ -69,7 +81,7 @@ export class StringRefArrayBuilder {
         return this.ids.length;
     }
     finalize(): Uint32Array {
-        return new Uint32Array(this.ids);
+        return this.ids.view;
     }
 }
 
@@ -118,8 +130,14 @@ class SingleStringRefField implements Field<SingleStringRefBuilder, string> {
 
 export const singleStringRef = () => new SingleStringRefField();
 
-const buildHashTable = (entries: { hashLow: number; hashHigh: number; value: number }[]) => {
-    const size = entries.length;
+/**
+ * Open-addressed table over three parallel u32 columns. Entries arrive as
+ * struct-of-arrays rather than an array of `{hashLow, hashHigh, value}` records:
+ * a million keys used to mean a million short-lived objects before a single byte
+ * was written.
+ */
+const buildHashTable = (keys: { lo: Uint32Array; hi: Uint32Array; values: Uint32Array }) => {
+    const size = keys.lo.length;
     if (size === 0) {
         return {
             keysLow: new Uint32Array(0),
@@ -134,8 +152,9 @@ const buildHashTable = (entries: { hashLow: number; hashHigh: number; value: num
     const keysHigh = new Uint32Array(capacity);
     const values = new Uint32Array(capacity);
 
-    for (let i = 0; i < entries.length; i++) {
-        let { hashLow, hashHigh, value } = entries[i];
+    for (let i = 0; i < size; i++) {
+        let hashLow = keys.lo[i];
+        const hashHigh = keys.hi[i];
         if (hashLow === 0 && hashHigh === 0) hashLow = 1;
 
         let slot = hashLow & mask;
@@ -144,60 +163,40 @@ const buildHashTable = (entries: { hashLow: number; hashHigh: number; value: num
         }
         keysLow[slot] = hashLow;
         keysHigh[slot] = hashHigh;
-        values[slot] = value;
+        values[slot] = keys.values[i];
     }
 
     return { keysLow, keysHigh, values };
 };
 
-const probeTable = (
-    keysLow: Uint32Array,
-    keysHigh: Uint32Array,
-    hashLow: number,
-    hashHigh: number,
-    onMatch: (slot: number) => boolean,
-): number => {
-    const cap = keysLow.length;
-    if (cap === 0) return -1;
-    const mask = cap - 1;
-    if (hashLow === 0 && hashHigh === 0) hashLow = 1;
-
-    let slot = hashLow & mask;
-    while (true) {
-        const kl = keysLow[slot];
-        const kh = keysHigh[slot];
-        if (kl === 0 && kh === 0) return -1;
-        if (kl === hashLow && kh === hashHigh) {
-            if (onMatch(slot)) return slot;
-        }
-        slot = (slot + 1) & mask;
-    }
-};
-
 export class HashLookupBuilder {
-    private entries: { hashLow: number; hashHigh: number; value: number }[] = [];
+    private readonly lo = new U32Buffer();
+    private readonly hi = new U32Buffer();
+    private readonly vals = new U32Buffer();
 
     add(key: string, value: number) {
         hashString(key);
-        this.entries.push({ hashLow: hashState.lo, hashHigh: hashState.hi, value });
+        this.addSplit(hashState.lo, hashState.hi, value);
     }
 
     addRaw(hash: bigint, value: number) {
         splitHash(hash);
-        this.entries.push({ hashLow: hashState.lo, hashHigh: hashState.hi, value });
+        this.addSplit(hashState.lo, hashState.hi, value);
     }
 
     addSplit(hashLow: number, hashHigh: number, value: number) {
-        this.entries.push({ hashLow, hashHigh, value });
+        this.lo.push(hashLow);
+        this.hi.push(hashHigh);
+        this.vals.push(value);
     }
 
     finalize() {
-        return buildHashTable(this.entries);
+        return buildHashTable({ lo: this.lo.view, hi: this.hi.view, values: this.vals.view });
     }
 }
 
 export class HashLookupReader {
-    private verifier?: (idx: number) => string;
+    private match?: (idx: number, key: string) => boolean;
 
     constructor(
         private keysLow: Uint32Array,
@@ -205,8 +204,14 @@ export class HashLookupReader {
         private values: Uint32Array,
     ) {}
 
+    /** Verify a probe hit against the resolved key. */
     setVerifier(fn: (idx: number) => string) {
-        this.verifier = fn;
+        this.match = (idx, key) => fn(idx) === key;
+    }
+
+    /** Verify a probe hit without materialising the stored key. */
+    setKeyMatcher(fn: (idx: number, key: string) => boolean) {
+        this.match = fn;
     }
 
     find(key: string): number | undefined {
@@ -219,20 +224,36 @@ export class HashLookupReader {
         return this.findByHashSplit(hashState.lo, hashState.hi);
     }
 
+    // The probe loop is written out here rather than shared through a callback:
+    // a lookup is the hottest thing a snapshot does, and passing an `onMatch`
+    // closure allocated one function per call and blocked inlining.
     findByHashSplit(hashLow: number, hashHigh: number, verifyKey?: string): number | undefined {
-        let result: number | undefined;
+        const keysLow = this.keysLow;
+        const capacity = keysLow.length;
+        if (capacity === 0) return undefined;
 
-        probeTable(this.keysLow, this.keysHigh, hashLow, hashHigh, (slot) => {
-            const value = this.values[slot];
-            if (verifyKey !== undefined && this.verifier) {
-                if (this.verifier(value) !== verifyKey) return false;
+        const keysHigh = this.keysHigh;
+        const mask = capacity - 1;
+
+        let lo = hashLow;
+        const hi = hashHigh;
+        if (lo === 0 && hi === 0) lo = 1;
+
+        let slot = lo & mask;
+        while (true) {
+            const kl = keysLow[slot];
+            const kh = keysHigh[slot];
+            if (kl === 0 && kh === 0) return undefined;
+
+            if (kl === lo && kh === hi) {
+                const value = this.values[slot];
+                if (verifyKey === undefined || this.match === undefined || this.match(value, verifyKey)) {
+                    return value;
+                }
             }
 
-            result = value;
-            return true;
-        });
-
-        return result;
+            slot = (slot + 1) & mask;
+        }
     }
 }
 
@@ -258,11 +279,12 @@ class HashLookupField implements Field<HashLookupBuilder, HashLookupReader> {
 
         if (this.opts.verifyVia) {
             const verifyVia = this.opts.verifyVia;
+            const strings = ctx.strings;
             let verifyField: Uint32Array | null = null;
 
-            reader.setVerifier((idx) => {
-                if (verifyField === null) verifyField = ctx.resolve<Uint32Array>(verifyVia);
-                return ctx.strings.get(verifyField[idx]);
+            reader.setKeyMatcher((idx, key) => {
+                const ids = verifyField ?? (verifyField = ctx.resolve<Uint32Array>(verifyVia));
+                return strings.equals(ids[idx], key);
             });
         }
 
@@ -274,66 +296,128 @@ export const hashLookup = (opts?: { verifyVia?: string }) => new HashLookupField
 
 const TRIGRAM_LEN = 3;
 
-const collectTrigrams = (text: string): string[] => {
-    const lower = text.toLowerCase();
-    const out: string[] = [];
+/** How many trigrams a lowercased string of this length yields. */
+const trigramCount = (len: number): number =>
+    len === 0 ? 0 : len < TRIGRAM_LEN ? 1 : len - TRIGRAM_LEN + 1;
 
-    if (lower.length < TRIGRAM_LEN) {
-        if (lower.length > 0) out.push(lower);
-        return out;
-    }
-
-    for (let i = 0; i + TRIGRAM_LEN <= lower.length; i++) {
-        out.push(lower.substring(i, i + TRIGRAM_LEN));
-    }
-
-    return out;
-};
+interface TrigramBucket {
+    lo: number;
+    hi: number;
+    ids: U32Buffer;
+    last: number;
+}
 
 export class TrigramIndexBuilder {
-    private buckets = new Map<bigint, Set<number>>();
+    // Keyed by the two halves of the 64-bit trigram hash. This used to be a
+    // Map<bigint, Set<number>>: every trigram of every name allocated a BigInt
+    // just to be hashed, and every posting list was a Set. Two numeric Map
+    // levels and a packed u32 list do the same job without either.
+    private readonly index = new Map<number, Map<number, TrigramBucket>>();
+    private readonly buckets: TrigramBucket[] = [];
+    private maxEntity = -1;
+    private postings = 0;
 
     addEntry(entityIdx: number, name: string) {
-        for (const trigram of collectTrigrams(name)) {
-            hashString(trigram);
-            const hash = hashToBigint() || 1n;
-            let set = this.buckets.get(hash);
-            if (!set) this.buckets.set(hash, (set = new Set()));
-            set.add(entityIdx);
+        const lower = name.toLowerCase();
+        const len = lower.length;
+        const count = trigramCount(len);
+
+        for (let t = 0; t < count; t++) {
+            // Hashing the slice in place — `substring(i, i + 3)` allocated one
+            // throwaway string per character of every name in the index.
+            hashChars(lower, len < TRIGRAM_LEN ? 0 : t, len < TRIGRAM_LEN ? len : t + TRIGRAM_LEN);
+            this.addSplit(hashState.lo, hashState.hi, entityIdx);
         }
     }
 
     addHash(hash: bigint, entityIdx: number) {
-        const h = hash || 1n;
-        let set = this.buckets.get(h);
-        if (!set) this.buckets.set(h, (set = new Set()));
-        set.add(entityIdx);
+        splitHash(hash);
+        this.addSplit(hashState.lo, hashState.hi, entityIdx);
+    }
+
+    private addSplit(hashLow: number, hashHigh: number, entityIdx: number) {
+        // Same sentinel the table uses: an all-zero key marks an empty slot.
+        const lo = hashLow === 0 && hashHigh === 0 ? 1 : hashLow;
+
+        let byLo = this.index.get(hashHigh);
+        if (byLo === undefined) this.index.set(hashHigh, (byLo = new Map()));
+
+        let bucket = byLo.get(lo);
+        if (bucket === undefined) {
+            bucket = { lo, hi: hashHigh, ids: new U32Buffer(), last: -1 };
+            byLo.set(lo, bucket);
+            this.buckets.push(bucket);
+        }
+
+        // Every trigram of one name is added in one go, so a repeated trigram
+        // ("ana" in "banana") always lands back-to-back in its bucket. Catching
+        // it here keeps the posting list from carrying duplicates at all.
+        if (bucket.last === entityIdx) return;
+        bucket.last = entityIdx;
+        bucket.ids.push(entityIdx);
+        this.postings++;
+
+        if (entityIdx > this.maxEntity) this.maxEntity = entityIdx;
     }
 
     finalize() {
-        const lookupEntries: { hashLow: number; hashHigh: number; value: number }[] = [];
-        const ptr: number[] = [0];
-        const data: number[] = [];
+        const count = this.buckets.length;
+        const lo = new Uint32Array(count);
+        const hi = new Uint32Array(count);
+        const values = new Uint32Array(count);
+        const ptr = new Uint32Array(count + 1);
+        const data = new U32Buffer(this.postings);
 
-        for (const [hash, ids] of this.buckets) {
-            splitHash(hash);
-            lookupEntries.push({ hashLow: hashState.lo, hashHigh: hashState.hi, value: ptr.length - 1 });
-            for (const id of ids) data.push(id);
-            ptr.push(data.length);
+        // The back-to-back guard above misses one case: the same entity indexed
+        // twice under different names, with another entity in between. Stamping
+        // catches it in O(1) per posting — but a sparse id space would make the
+        // stamp array larger than the index itself, so that falls back to a Set.
+        const dense = this.maxEntity >= 0 && this.maxEntity + 1 <= this.postings * 4 + 1024;
+        const stamp = dense ? new Int32Array(this.maxEntity + 1).fill(-1) : null;
+        const seen = dense ? null : new Set<number>();
+
+        for (let b = 0; b < count; b++) {
+            const bucket = this.buckets[b];
+            lo[b] = bucket.lo;
+            hi[b] = bucket.hi;
+            values[b] = b;
+
+            const ids = bucket.ids.view;
+            seen?.clear();
+
+            for (let i = 0; i < ids.length; i++) {
+                const id = ids[i];
+                if (stamp !== null) {
+                    if (stamp[id] === b) continue;
+                    stamp[id] = b;
+                } else if (seen!.has(id)) {
+                    continue;
+                } else {
+                    seen!.add(id);
+                }
+                data.push(id);
+            }
+
+            ptr[b + 1] = data.length;
         }
 
-        const lookup = buildHashTable(lookupEntries);
+        const lookup = buildHashTable({ lo, hi, values });
         return {
             keysLow: lookup.keysLow,
             keysHigh: lookup.keysHigh,
             values: lookup.values,
-            ptr: new Uint32Array(ptr),
-            data: new Uint32Array(data),
+            ptr,
+            data: data.view,
         };
     }
 }
 
 export class TrigramIndexReader {
+    private scores: Uint32Array | null = null;
+    private stamp: Int32Array | null = null;
+    private matches: Map<number, number> | null = null;
+    private generation = 0;
+
     constructor(
         private keysLow: Uint32Array,
         private keysHigh: Uint32Array,
@@ -346,36 +430,61 @@ export class TrigramIndexReader {
         query: string,
         opts: { dynamicCutoffRatio?: number; limit?: number } = {},
     ): { idx: number; score: number }[] {
-        const cutoffRatio = opts.dynamicCutoffRatio ?? 0.7;
-        const trigrams = collectTrigrams(query);
-        if (trigrams.length === 0) return [];
+        const lower = query.toLowerCase();
+        const len = lower.length;
+        const trigrams = trigramCount(len);
+        if (trigrams === 0) return [];
 
-        const matches = new Map<number, number>();
+        if (this.scores === null && this.matches === null) this.prepareScratch();
+
+        const scores = this.scores;
+        const stamp = this.stamp;
+        const matches = this.matches;
+        const generation = this.nextGeneration();
+        matches?.clear();
+
+        const ptr = this.ptr;
+        const data = this.data;
+        const touched: number[] = [];
         let maxScore = 0;
 
-        for (const trigram of trigrams) {
-            hashString(trigram);
+        for (let t = 0; t < trigrams; t++) {
+            hashChars(lower, len < TRIGRAM_LEN ? 0 : t, len < TRIGRAM_LEN ? len : t + TRIGRAM_LEN);
+
             const bucketIdx = this.findBucket(hashState.lo, hashState.hi);
             if (bucketIdx === -1) continue;
 
-            const start = this.ptr[bucketIdx];
-            const end = this.ptr[bucketIdx + 1];
+            const from = ptr[bucketIdx];
+            const to = ptr[bucketIdx + 1];
 
-            for (let i = start; i < end; i++) {
-                const id = this.data[i];
-                const count = (matches.get(id) ?? 0) + 1;
-                if (count > maxScore) maxScore = count;
+            for (let i = from; i < to; i++) {
+                const id = data[i];
+                let score: number;
 
-                matches.set(id, count);
+                if (scores !== null) {
+                    if (stamp![id] !== generation) {
+                        stamp![id] = generation;
+                        scores[id] = 0;
+                        touched.push(id);
+                    }
+                    score = ++scores[id];
+                } else {
+                    score = (matches!.get(id) ?? 0) + 1;
+                    if (score === 1) touched.push(id);
+                    matches!.set(id, score);
+                }
+
+                if (score > maxScore) maxScore = score;
             }
         }
 
-        const minMatches = Math.max(1, trigrams.length - 1);
-        const cutoff = Math.max(minMatches, maxScore * cutoffRatio);
-
+        const minMatches = Math.max(1, trigrams - 1);
+        const cutoff = Math.max(minMatches, maxScore * (opts.dynamicCutoffRatio ?? 0.7));
         const results: { idx: number; score: number }[] = [];
 
-        for (const [idx, score] of matches) {
+        for (let i = 0; i < touched.length; i++) {
+            const idx = touched[i];
+            const score = scores !== null ? scores[idx] : matches!.get(idx)!;
             if (score >= cutoff) results.push({ idx, score });
         }
 
@@ -388,15 +497,56 @@ export class TrigramIndexReader {
         return results;
     }
 
+    /**
+     * Scoring scratch, allocated on the first search and reused after that.
+     * Tallying into a fresh `Map` per query cost a hash per posting visited;
+     * indexing a typed array by entity id costs nothing. The array is only worth
+     * it when ids are dense — otherwise it would dwarf the index it serves, and
+     * a reused Map takes over.
+     */
+    private prepareScratch() {
+        const data = this.data;
+        let max = -1;
+        for (let i = 0; i < data.length; i++) {
+            if (data[i] > max) max = data[i];
+        }
+
+        if (max >= 0 && max + 1 <= data.length * 4 + 1024) {
+            this.scores = new Uint32Array(max + 1);
+            this.stamp = new Int32Array(max + 1);
+        } else {
+            this.matches = new Map();
+        }
+    }
+
+    private nextGeneration(): number {
+        if (this.generation === 0x7fffffff) {
+            this.stamp?.fill(0);
+            this.generation = 0;
+        }
+        return ++this.generation;
+    }
+
     private findBucket(hashLow: number, hashHigh: number): number {
-        let result = -1;
+        const keysLow = this.keysLow;
+        const capacity = keysLow.length;
+        if (capacity === 0) return -1;
 
-        probeTable(this.keysLow, this.keysHigh, hashLow, hashHigh, (slot) => {
-            result = this.values[slot];
-            return true;
-        });
+        const keysHigh = this.keysHigh;
+        const mask = capacity - 1;
 
-        return result;
+        let lo = hashLow;
+        const hi = hashHigh;
+        if (lo === 0 && hi === 0) lo = 1;
+
+        let slot = lo & mask;
+        while (true) {
+            const kl = keysLow[slot];
+            const kh = keysHigh[slot];
+            if (kl === 0 && kh === 0) return -1;
+            if (kl === lo && kh === hi) return this.values[slot];
+            slot = (slot + 1) & mask;
+        }
     }
 }
 
@@ -426,21 +576,35 @@ class TrigramIndexField implements Field<TrigramIndexBuilder, TrigramIndexReader
 export const trigramIndex = () => new TrigramIndexField();
 
 export class SortedU32IndexBuilder {
-    private pairs: { key: number; value: number }[] = [];
-    add(key: number, value: number) {
-        this.pairs.push({ key, value });
-    }
-    finalize(): { keys: Uint32Array; values: Uint32Array } {
-        this.pairs.sort((a, b) => a.key - b.key);
-        const keys = new Uint32Array(this.pairs.length);
-        const values = new Uint32Array(this.pairs.length);
+    private readonly keys = new U32Buffer();
+    private readonly values = new U32Buffer();
 
-        for (let i = 0; i < this.pairs.length; i++) {
-            keys[i] = this.pairs[i].key;
-            values[i] = this.pairs[i].value;
+    add(key: number, value: number) {
+        this.keys.push(key);
+        this.values.push(value);
+    }
+
+    finalize(): { keys: Uint32Array; values: Uint32Array } {
+        const keys = this.keys.view;
+        const values = this.values.view;
+        const size = keys.length;
+
+        // Sorting a permutation keeps the pairs as two u32 columns throughout.
+        // Sorting `{ key, value }` records meant one object per entry plus a
+        // pointer array the same size again, all of it garbage afterwards.
+        const order = new Uint32Array(size);
+        for (let i = 0; i < size; i++) order[i] = i;
+        order.sort((a, b) => keys[a] - keys[b] || a - b);
+
+        const outKeys = new Uint32Array(size);
+        const outValues = new Uint32Array(size);
+        for (let i = 0; i < size; i++) {
+            const from = order[i];
+            outKeys[i] = keys[from];
+            outValues[i] = values[from];
         }
 
-        return { keys, values };
+        return { keys: outKeys, values: outValues };
     }
 }
 
@@ -511,27 +675,54 @@ class RawBytesField implements Field<RawBytesBuilder, Uint8Array> {
 export const rawBytes = () => new RawBytesField();
 
 export class BucketArrayBuilder<S extends ColumnSpec> {
-    private store: ColumnStore<{ data: S }>;
-    public readonly ptr: number[] = [0];
+    // The single column is held directly instead of through ColumnStore:
+    // routing every value through `store.push({ data: value })` allocated a
+    // wrapper object per item, on the path that runs once per element written.
+    private readonly store: NumberBuffer | U32Buffer;
+    private readonly stride: number;
+    private readonly ptrBuf = new U32Buffer();
 
-    constructor(spec: S, strings: StringInterner) {
-        this.store = new ColumnStore({ data: spec } as { data: S }, strings);
+    constructor(
+        private readonly spec: S,
+        private readonly strings: StringInterner,
+        label = "data",
+    ) {
+        this.store = spec.kind === "num" ? new NumberBuffer(spec.ctor, label) : new U32Buffer();
+        this.stride = spec.kind === "num" ? spec.stride : 1;
+        this.ptrBuf.push(0);
     }
 
-    get values(): number[] {
-        return (this.store.buffers as any).data;
+    get ptr(): Uint32Array {
+        return this.ptrBuf.view;
+    }
+
+    get values(): AnyTypedArray {
+        return this.store.view;
     }
 
     push(value: ColumnWriteValue<S>) {
-        this.store.push({ data: value } as any);
+        if (this.spec.kind !== "num") {
+            (this.store as U32Buffer).push(this.strings.add((value as string) ?? ""));
+            return;
+        }
+
+        const store = this.store as NumberBuffer;
+        if (this.stride === 1) {
+            store.push(value as number);
+            return;
+        }
+
+        const arr = value as ArrayLike<number>;
+        store.reserve(this.stride);
+        for (let s = 0; s < this.stride; s++) store.push(arr[s] ?? 0);
     }
 
     endBucket() {
-        this.ptr.push(this.store.itemCount());
+        this.ptrBuf.push(this.store.length / this.stride);
     }
 
     get bucketCount(): number {
-        return this.ptr.length - 1;
+        return this.ptrBuf.length - 1;
     }
 
     addBucket(values: ArrayLike<ColumnWriteValue<S>>) {
@@ -540,18 +731,21 @@ export class BucketArrayBuilder<S extends ColumnSpec> {
     }
 
     finalize() {
-        const [data] = this.store.finalize();
-        return { ptr: new Uint32Array(this.ptr), data };
+        return { ptr: this.ptrBuf.view, data: this.store.view };
     }
 }
 
 export class BucketArrayReader<S extends ColumnSpec> {
+    private readonly stride: number;
+
     constructor(
         public readonly ptr: Uint32Array,
         public readonly data: ColumnView<S>,
         private readonly spec: S,
         private readonly strings: StringReader,
-    ) {}
+    ) {
+        this.stride = spec.kind === "num" ? spec.stride : 1;
+    }
 
     get bucketCount(): number {
         return this.ptr.length - 1;
@@ -566,14 +760,11 @@ export class BucketArrayReader<S extends ColumnSpec> {
     }
 
     slice(bucketIdx: number): ColumnView<S> {
-        const start = this.ptr[bucketIdx];
-        const end = this.ptr[bucketIdx + 1];
-
-        if (this.spec.kind === "num" && this.spec.stride !== 1) {
-            return (this.data as any).subarray(start * this.spec.stride, end * this.spec.stride);
-        }
-
-        return (this.data as any).subarray(start, end);
+        const stride = this.stride;
+        const data = this.data as AnyTypedArray;
+        const start = this.ptr[bucketIdx] * stride;
+        const end = this.ptr[bucketIdx + 1] * stride;
+        return data.subarray(start, end) as ColumnView<S>;
     }
 
     get(bucketIdx: number, itemIdx: number): ColumnReadValue<S> {
@@ -589,7 +780,7 @@ class BucketArrayField<S extends ColumnSpec> implements Field<BucketArrayBuilder
         return `bucketArray:${this.spec.tag}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new BucketArrayBuilder(this.spec, ctx.strings);
+        return new BucketArrayBuilder(this.spec, ctx.strings, ctx.name ?? "data");
     }
     finalize(builder: BucketArrayBuilder<S>): FieldSection[] {
         const { ptr, data } = builder.finalize();
@@ -609,10 +800,15 @@ export const bucketArray = <S extends ColumnSpec>(spec: S) => new BucketArrayFie
 
 export class MultiBucketArrayBuilder<C extends Columns> {
     private store: ColumnStore<C>;
-    public readonly ptr: number[] = [0];
+    private readonly ptrBuf = new U32Buffer();
 
-    constructor(columns: C, strings: StringInterner) {
-        this.store = new ColumnStore(columns, strings);
+    constructor(columns: C, strings: StringInterner, label?: string) {
+        this.store = new ColumnStore(columns, strings, label);
+        this.ptrBuf.push(0);
+    }
+
+    get ptr(): Uint32Array {
+        return this.ptrBuf.view;
     }
 
     push(item: { [K in keyof C]: ColumnWriteValue<C[K]> }) {
@@ -620,15 +816,15 @@ export class MultiBucketArrayBuilder<C extends Columns> {
     }
 
     endBucket() {
-        this.ptr.push(this.store.itemCount());
+        this.ptrBuf.push(this.store.itemCount());
     }
 
     get bucketCount(): number {
-        return this.ptr.length - 1;
+        return this.ptrBuf.length - 1;
     }
 
-    get buffers(): { readonly [K in keyof C]: number[] } {
-        return this.store.buffers as { readonly [K in keyof C]: number[] };
+    get buffers(): { readonly [K in keyof C]: AnyTypedArray } {
+        return this.store.buffers;
     }
 
     addBucket(items: { [K in keyof C]: ColumnWriteValue<C[K]> }[]) {
@@ -638,7 +834,7 @@ export class MultiBucketArrayBuilder<C extends Columns> {
 
     finalize() {
         return {
-            ptr: new Uint32Array(this.ptr),
+            ptr: this.ptrBuf.view,
             columns: this.store.finalize(),
         };
     }
@@ -661,14 +857,19 @@ class MultiBucketArrayField<C extends Columns> implements Field<
     MultiBucketArrayReader<C>
 > {
     readonly sectionCount: number;
+    private readonly keys: string[];
+    private readonly specs: ColumnSpec[];
+
     constructor(private columns: C) {
-        this.sectionCount = 1 + Object.keys(columns).length;
+        this.keys = Object.keys(columns);
+        this.specs = this.keys.map((key) => columns[key]);
+        this.sectionCount = 1 + this.keys.length;
     }
     signature() {
         return `multiBucketArray:${columnsSignature(this.columns)}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new MultiBucketArrayBuilder(this.columns, ctx.strings);
+        return new MultiBucketArrayBuilder(this.columns, ctx.strings, ctx.name);
     }
     finalize(builder: MultiBucketArrayBuilder<C>): FieldSection[] {
         const { ptr, columns } = builder.finalize();
@@ -676,8 +877,9 @@ class MultiBucketArrayField<C extends Columns> implements Field<
     }
     createReader(ctx: ReaderContext): MultiBucketArrayReader<C> {
         const ptr = ctx.view(0, Uint32Array);
-        const cols = readColumns(this.columns, ctx, 1);
-        const columns = this.columns;
+        const cols = readColumns(this.columns, ctx, 1) as Record<string, AnyTypedArray>;
+        const keys = this.keys;
+        const specs = this.specs;
         const strings = ctx.strings;
 
         const base: MultiBucketBase<C> = {
@@ -693,12 +895,14 @@ class MultiBucketArrayField<C extends Columns> implements Field<
             },
             get(bucketIdx, itemIdx) {
                 const offset = ptr[bucketIdx] + itemIdx;
-                const result: any = {};
-                for (const key of Object.keys(columns)) {
-                    const spec = columns[key];
-                    result[key] = readColumnValue(spec, (cols as any)[key], offset, strings);
+                const result: Record<string, unknown> = {};
+                // keys/specs are resolved once when the field is built, not on
+                // every read: this used to call Object.keys() per get().
+                for (let i = 0; i < keys.length; i++) {
+                    const key = keys[i];
+                    result[key] = readColumnValue(specs[i], cols[key] as any, offset, strings);
                 }
-                return result;
+                return result as { [K in keyof C]: ColumnReadValue<C[K]> };
             },
         };
         return Object.assign(base, cols) as MultiBucketArrayReader<C>;
@@ -711,8 +915,8 @@ export class KeyedIndexBuilder<S extends ColumnSpec> {
     private lookup = new HashLookupBuilder();
     private buckets: BucketArrayBuilder<S>;
 
-    constructor(spec: S, strings: StringInterner) {
-        this.buckets = new BucketArrayBuilder(spec, strings);
+    constructor(spec: S, strings: StringInterner, label?: string) {
+        this.buckets = new BucketArrayBuilder(spec, strings, label);
     }
 
     add(key: string, values: ArrayLike<ColumnWriteValue<S>>) {
@@ -748,7 +952,7 @@ class KeyedIndexField<S extends ColumnSpec> implements Field<KeyedIndexBuilder<S
         return `keyedIndex:${this.spec.tag}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new KeyedIndexBuilder(this.spec, ctx.strings);
+        return new KeyedIndexBuilder(this.spec, ctx.strings, ctx.name);
     }
     finalize(builder: KeyedIndexBuilder<S>): FieldSection[] {
         const finalised = builder.finalize();
@@ -783,8 +987,8 @@ export class PairIndexBuilder<C extends Columns> {
     private store: ColumnStore<C>;
     private count = 0;
 
-    constructor(columns: C, strings: StringInterner) {
-        this.store = new ColumnStore(columns, strings);
+    constructor(columns: C, strings: StringInterner, label?: string) {
+        this.store = new ColumnStore(columns, strings, label);
     }
 
     add(a: number, b: number, item: { [K in keyof C]: ColumnWriteValue<C[K]> }) {
@@ -802,23 +1006,30 @@ export class PairIndexBuilder<C extends Columns> {
 }
 
 export class PairIndexReader<C extends Columns> {
+    private readonly keys: string[];
+    private readonly specs: ColumnSpec[];
+
     constructor(
         private lookup: HashLookupReader,
-        private columns: C,
+        columns: C,
         private views: { [K in keyof C]: ColumnView<C[K]> },
         private strings: StringReader,
-    ) {}
+    ) {
+        this.keys = Object.keys(columns);
+        this.specs = this.keys.map((key) => columns[key]);
+    }
 
     find(a: number, b: number): { [K in keyof C]: ColumnReadValue<C[K]> } | undefined {
         const idx = this.lookup.findByHashSplit(b >>> 0, (a + 1) >>> 0);
         if (idx === undefined) return undefined;
 
-        const result: any = {};
-        for (const key of Object.keys(this.columns)) {
-            const spec = this.columns[key];
-            result[key] = readColumnValue(spec, (this.views as any)[key], idx, this.strings);
+        const views = this.views as Record<string, AnyTypedArray>;
+        const result: Record<string, unknown> = {};
+        for (let i = 0; i < this.keys.length; i++) {
+            const key = this.keys[i];
+            result[key] = readColumnValue(this.specs[i], views[key] as any, idx, this.strings);
         }
-        return result;
+        return result as { [K in keyof C]: ColumnReadValue<C[K]> };
     }
 }
 
@@ -831,7 +1042,7 @@ class PairIndexField<C extends Columns> implements Field<PairIndexBuilder<C>, Pa
         return `pairIndex:${columnsSignature(this.columns)}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new PairIndexBuilder(this.columns, ctx.strings);
+        return new PairIndexBuilder(this.columns, ctx.strings, ctx.name);
     }
     finalize(builder: PairIndexBuilder<C>): FieldSection[] {
         const { lookup, columns } = builder.finalize();

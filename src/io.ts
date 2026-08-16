@@ -1,5 +1,5 @@
-import type { OpenOptions, OpenResult, Schema } from "./schema.js";
-import type { SchemaShape } from "./types.js";
+import type { OpenOptions, OpenResult, Schema } from "./schema.ts";
+import type { SchemaShape } from "./types.ts";
 
 export interface ReadFileOptions {
     shared?: boolean;

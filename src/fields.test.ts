@@ -15,8 +15,8 @@ import {
     TrigramIndexReader,
     stringRef,
     u32,
-} from "./index";
-import { StringInterner, StringReader } from "./strings";
+} from "./index.ts";
+import { StringInterner, StringReader } from "./strings.ts";
 
 const makeStringReader = (interner: StringInterner): StringReader => {
     const { offsets, data } = interner.serialize();

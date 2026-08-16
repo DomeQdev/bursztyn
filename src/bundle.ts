@@ -1,7 +1,7 @@
-import { BursztynError, formatDiff, type FieldDiff } from "./errors.js";
-import type { ManifestEntry } from "./format.js";
-import type { Migration, MigrationStep } from "./migrate.js";
-import type { SchemaShape } from "./types.js";
+import { BursztynError, formatDiff, type FieldDiff } from "./errors.ts";
+import type { ManifestEntry } from "./format.ts";
+import type { Migration, MigrationStep } from "./migrate.ts";
+import type { SchemaShape } from "./types.ts";
 
 export const enforcement = { enabled: true };
 

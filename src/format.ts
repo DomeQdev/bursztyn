@@ -1,8 +1,8 @@
-import { FormatError, type FieldDiff } from "./errors.js";
-import type { CompiledSchema, FieldLayout } from "./layout.js";
-import { fieldFromSignature } from "./registry.js";
-import { STRING_TABLE_SIGNATURE, StringReader } from "./strings.js";
-import type { AnyTypedArray, ReaderContext, Readers, SchemaShape, SnapshotSource } from "./types.js";
+import { FormatError, type FieldDiff } from "./errors.ts";
+import type { CompiledSchema, FieldLayout } from "./layout.ts";
+import { fieldFromSignature } from "./registry.ts";
+import { STRING_TABLE_SIGNATURE, StringReader } from "./strings.ts";
+import type { AnyTypedArray, ReaderContext, Readers, SchemaShape, SnapshotSource } from "./types.ts";
 
 // [0..4)   magic "BRSZ"          [4..6)   format version   [6..8)   flags
 // [8..16)  schema hash u64       [16..20) schema version   [20..24) section count
@@ -15,6 +15,11 @@ export const FIXED_HEADER_BYTES = 32;
 
 const SECTION_ALIGN = 8;
 const alignUp = (n: number) => (n + (SECTION_ALIGN - 1)) & ~(SECTION_ALIGN - 1);
+
+// Both are stateless and were being constructed per call — readHeader() runs on
+// every read, migration step and inspect.
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
 
 export interface ManifestEntry {
     name: string;
@@ -54,7 +59,7 @@ export const assembleSnapshot = (
         sectionCount: sections.length,
     }));
 
-    const manifestBytes = new TextEncoder().encode(
+    const manifestBytes = ENCODER.encode(
         JSON.stringify(manifest.map((e) => [e.name, e.signature, e.sectionCount])),
     );
 
@@ -135,8 +140,15 @@ export const readHeader = (source: SnapshotSource): SnapshotHeader => {
     const manifestOffset = view.getUint32(24, true);
     const manifestLength = view.getUint32(28, true);
 
+    if (FIXED_HEADER_BYTES + sectionCount * 8 > bytes.byteLength) {
+        throw new FormatError(
+            `Snapshot is truncated: header claims ${sectionCount} sections but the file is ` +
+                `only ${bytes.byteLength} bytes.`,
+        );
+    }
+
     const raw = JSON.parse(
-        new TextDecoder().decode(bytes.subarray(manifestOffset, manifestOffset + manifestLength)),
+        DECODER.decode(bytes.subarray(manifestOffset, manifestOffset + manifestLength)),
     ) as [string, string, number][];
 
     return {
@@ -144,11 +156,14 @@ export const readHeader = (source: SnapshotSource): SnapshotHeader => {
         schemaHash: view.getBigUint64(8, true),
         schemaVersion: view.getUint32(16, true),
         manifest: raw.map(([name, signature, count]) => ({ name, signature, sectionCount: count })),
+        // A view, not a copy. The header check above guarantees an 8-byte
+        // aligned byteOffset and the table sits at a fixed 32-byte offset, so
+        // it is always safely u32-aligned — opening a snapshot should not have
+        // to duplicate its section table first.
         sectionTable: new Uint32Array(
-            bytes.buffer.slice(
-                bytes.byteOffset + FIXED_HEADER_BYTES,
-                bytes.byteOffset + FIXED_HEADER_BYTES + sectionCount * 8,
-            ),
+            bytes.buffer,
+            bytes.byteOffset + FIXED_HEADER_BYTES,
+            sectionCount * 2,
         ),
         bytes,
     };

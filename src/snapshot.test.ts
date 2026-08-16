@@ -24,9 +24,9 @@ import {
     u8,
     u32,
     type MultiBucketArrayReader,
-} from "./index";
-import { createReadersFromLayout } from "./format";
-import type { BucketArrayReader, KeyedIndexReader, PairIndexReader } from "./fields";
+} from "./index.ts";
+import { createReadersFromLayout } from "./format.ts";
+import type { BucketArrayReader, KeyedIndexReader, PairIndexReader } from "./fields.ts";
 
 const schema = defineSchema({
     version: 1,

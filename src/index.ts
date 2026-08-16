@@ -1,5 +1,5 @@
-export { defineSchema, migration, Schema } from "./schema.js";
-export type { OpenOptions, OpenResult, SchemaDefinition } from "./schema.js";
+export { defineSchema, migration, Schema } from "./schema.ts";
+export type { OpenOptions, OpenResult, SchemaDefinition } from "./schema.ts";
 
 export {
     defineMigrations,
@@ -10,7 +10,7 @@ export {
     UnfinishedMigrationError,
     type MigrationBundle,
     type MigrationBundleInput,
-} from "./bundle.js";
+} from "./bundle.ts";
 
 export {
     describeChange,
@@ -23,7 +23,7 @@ export {
     type GenerateOptions,
     type GenerateResult,
     type SchemaChange,
-} from "./generate.js";
+} from "./generate.ts";
 
 export {
     emptyJournal,
@@ -32,9 +32,9 @@ export {
     type Journal,
     type JournalEntry,
     type SchemaSnapshot,
-} from "./journal.js";
+} from "./journal.ts";
 
-export { SnapshotBuilder } from "./builder.js";
+export { SnapshotBuilder } from "./builder.ts";
 
 export {
     migrateSnapshot,
@@ -47,7 +47,7 @@ export {
     type MigrationStepReport,
     type MigrationTarget,
     type PreviousSnapshot,
-} from "./migrate.js";
+} from "./migrate.ts";
 
 export {
     assembleSnapshot,
@@ -65,9 +65,9 @@ export {
     type ManifestEntry,
     type SnapshotHeader,
     type SnapshotInfo,
-} from "./format.js";
+} from "./format.ts";
 
-export { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
+export { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.ts";
 
 export {
     openSnapshotFile,
@@ -75,7 +75,7 @@ export {
     writeSnapshotFile,
     type OpenFileOptions,
     type ReadFileOptions,
-} from "./io.js";
+} from "./io.ts";
 
 export {
     BursztynError,
@@ -87,9 +87,9 @@ export {
     SchemaMismatchError,
     UnknownSignatureError,
     type FieldDiff,
-} from "./errors.js";
+} from "./errors.ts";
 
-export { StringInterner, StringReader, stringTable } from "./strings.js";
+export { StringInterner, StringReader, stringTable } from "./strings.ts";
 
 export {
     bucketArray,
@@ -121,7 +121,7 @@ export {
     TrigramIndexBuilder,
     TrigramIndexReader,
     type MultiBucketArrayReader,
-} from "./fields.js";
+} from "./fields.ts";
 
 export {
     assertNumericRange,
@@ -143,11 +143,11 @@ export {
     type ColumnWriteValue,
     type NumColumnSpec,
     type StringRefColumnSpec,
-} from "./columns.js";
+} from "./columns.ts";
 
-export { fieldFromSignature } from "./registry.js";
+export { fieldFromSignature } from "./registry.ts";
 
-export { hashString, hashStringToBigint, splitHash } from "./hash.js";
+export { hashString, hashStringToBigint, splitHash } from "./hash.ts";
 
 export type {
     AnyTypedArray,
@@ -162,4 +162,4 @@ export type {
     SchemaShape,
     SnapshotSource,
     TypedArrayConstructor,
-} from "./types.js";
+} from "./types.ts";

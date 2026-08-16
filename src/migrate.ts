@@ -1,10 +1,10 @@
-import { SnapshotBuilder } from "./builder.js";
+import { SnapshotBuilder } from "./builder.ts";
 import {
     BursztynError,
     CarryConflictError,
     MigrationDataLossError,
     MigrationPathError,
-} from "./errors.js";
+} from "./errors.ts";
 import {
     createReadersFromLayout,
     layoutFromManifest,
@@ -12,11 +12,11 @@ import {
     sectionBytes,
     toBytes,
     type SnapshotHeader,
-} from "./format.js";
-import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
-import { fieldFromSignature } from "./registry.js";
-import { StringInterner, STRING_TABLE_SIGNATURE, type StringReader } from "./strings.js";
-import type { AnyTypedArray, Builders, Field, SchemaShape, SnapshotSource } from "./types.js";
+} from "./format.ts";
+import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.ts";
+import { fieldFromSignature } from "./registry.ts";
+import { StringInterner, STRING_TABLE_SIGNATURE, type StringReader } from "./strings.ts";
+import type { AnyTypedArray, Builders, Field, SchemaShape, SnapshotSource } from "./types.ts";
 
 export interface PreviousSnapshot {
     readonly version: number;
@@ -267,14 +267,28 @@ const finalizeOrNull = (layout: FieldLayout, builder: unknown): Uint8Array[] | n
     }
 };
 
+// What an untouched builder of this field type emits. It depends only on the
+// signature, so building and finalising one per carried field per step — which
+// is what this used to do — was repeated work with a constant answer.
+const pristineCache = new Map<string, Uint8Array[] | null>();
+
+const pristineSections = (layout: FieldLayout): Uint8Array[] | null => {
+    const cached = pristineCache.get(layout.signature);
+    if (cached !== undefined) return cached;
+
+    const sections = finalizeOrNull(
+        layout,
+        layout.field.createBuilder({ strings: new StringInterner(), name: layout.name }),
+    );
+    pristineCache.set(layout.signature, sections);
+    return sections;
+};
+
 const builderWasWritten = (layout: FieldLayout, builder: unknown): boolean => {
     const actual = finalizeOrNull(layout, builder);
     if (actual === null) return true;
 
-    const pristine = finalizeOrNull(
-        layout,
-        layout.field.createBuilder({ strings: new StringInterner() }),
-    );
+    const pristine = pristineSections(layout);
     if (pristine === null) return true;
     if (pristine.length !== actual.length) return true;
 

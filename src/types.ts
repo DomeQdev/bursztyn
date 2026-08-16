@@ -1,4 +1,4 @@
-import type { StringInterner, StringReader } from "./strings.js";
+import type { StringInterner, StringReader } from "./strings.ts";
 
 export type AnyTypedArray =
     | Int8Array
@@ -38,6 +38,8 @@ export interface Field<Builder = unknown, Reader = unknown> {
 
 export interface BuilderContext {
     strings: StringInterner;
+    /** The field being built. Used to name the field in range errors. */
+    name?: string;
 }
 
 export interface ReaderContext {

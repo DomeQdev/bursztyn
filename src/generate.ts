@@ -1,4 +1,4 @@
-import { diffManifest, type ManifestEntry } from "./format.js";
+import { diffManifest, type ManifestEntry } from "./format.ts";
 import {
     barrelPath,
     journalPath,
@@ -9,9 +9,9 @@ import {
     type Journal,
     type JournalEntry,
     type SchemaSnapshot,
-} from "./journal.js";
-import type { CompiledSchema } from "./layout.js";
-import type { FieldDiff } from "./errors.js";
+} from "./journal.ts";
+import type { CompiledSchema } from "./layout.ts";
+import type { FieldDiff } from "./errors.ts";
 
 const COLUMN_ALIASES: Record<string, string> = {
     "Uint8Array:1": "u8()",

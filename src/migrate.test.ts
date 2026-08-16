@@ -13,7 +13,7 @@ import {
     stringTable,
     u32,
     type BucketArrayReader,
-} from "./index";
+} from "./index.ts";
 
 const v1 = defineSchema({
     version: 1,

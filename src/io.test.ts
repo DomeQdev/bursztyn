@@ -12,7 +12,7 @@ import {
     stringRefArray,
     stringTable,
     writeSnapshotFile,
-} from "./index";
+} from "./index.ts";
 
 const dir = await mkdtemp(join(tmpdir(), "bursztyn-io-"));
 afterAll(() => rm(dir, { recursive: true, force: true }));

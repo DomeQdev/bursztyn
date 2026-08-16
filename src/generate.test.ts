@@ -23,9 +23,9 @@ import {
     u32,
     type Journal,
     type SchemaSnapshot,
-} from "./index";
-import { fieldFromSignature } from "./registry";
-import { MissingMigrationsError, SchemaDriftError, UnfinishedMigrationError } from "./bundle";
+} from "./index.ts";
+import { fieldFromSignature } from "./registry.ts";
+import { MissingMigrationsError, SchemaDriftError, UnfinishedMigrationError } from "./bundle.ts";
 
 const baseFields = {
     strings: stringTable(),

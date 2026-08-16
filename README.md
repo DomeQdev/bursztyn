@@ -82,8 +82,9 @@ snapshot; there is no intermediate object anywhere.
 
 ## Fields
 
-Every field is a column, or a small index over columns. Pick the narrowest type that fits — the
-builder throws a `RangeError` naming the field and the offending value if something overflows.
+Every field is a column, or a small index over columns. Pick the narrowest type that fits — values
+go straight into the target typed array as you push them, and a `RangeError` naming the field and
+the offending value is thrown at the `push` that overflows, not later at `build()`.
 
 | Field | Reader | For |
 | --- | --- | --- |

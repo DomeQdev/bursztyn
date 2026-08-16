@@ -2,9 +2,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { enforcement } from "./bundle.js";
-import { diffManifest, inspect, isSnapshot } from "./format.js";
-import { planGeneration, renameCandidates, type SchemaChange } from "./generate.js";
+import { enforcement } from "./bundle.ts";
+import { diffManifest, inspect, isSnapshot } from "./format.ts";
+import { planGeneration, renameCandidates, type SchemaChange } from "./generate.ts";
 import {
     emptyJournal,
     parseJournal,
@@ -13,9 +13,9 @@ import {
     journalPath,
     type Journal,
     type SchemaSnapshot,
-} from "./journal.js";
-import { readSnapshotFile } from "./io.js";
-import { Schema } from "./schema.js";
+} from "./journal.ts";
+import { readSnapshotFile } from "./io.ts";
+import { Schema } from "./schema.ts";
 
 const tty = process.stdout.isTTY === true;
 const paint = (code: string, text: string) => (tty ? `[${code}m${text}[0m` : text);

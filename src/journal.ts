@@ -1,5 +1,5 @@
-import { FormatError } from "./errors.js";
-import type { ManifestEntry } from "./format.js";
+import { FormatError } from "./errors.ts";
+import type { ManifestEntry } from "./format.ts";
 
 export const JOURNAL_FORMAT = 1;
 

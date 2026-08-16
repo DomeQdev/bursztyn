@@ -1,13 +1,17 @@
 {
     "compilerOptions": {
         "target": "ES2022",
-        "module": "ESNext",
-        "moduleResolution": "bundler",
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
         "lib": ["ES2022"],
         "strict": true,
+        "noUncheckedIndexedAccess": false,
         "skipLibCheck": true,
         "verbatimModuleSyntax": true,
         "forceConsistentCasingInFileNames": true,
+        "allowImportingTsExtensions": true,
+        "rewriteRelativeImportExtensions": true,
+
         "noEmit": true
     },
     "include": ["src", "examples"]

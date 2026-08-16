@@ -1,8 +1,8 @@
-import { BursztynError } from "./errors.js";
-import { assembleSnapshot, type EmittedField } from "./format.js";
-import type { CompiledSchema } from "./layout.js";
-import { StringInterner } from "./strings.js";
-import type { AnyTypedArray, Builders, BuilderContext, SchemaShape } from "./types.js";
+import { BursztynError } from "./errors.ts";
+import { assembleSnapshot, type EmittedField } from "./format.ts";
+import type { CompiledSchema } from "./layout.ts";
+import { StringInterner } from "./strings.ts";
+import type { AnyTypedArray, Builders, BuilderContext, SchemaShape } from "./types.ts";
 
 const asBytes = (data: AnyTypedArray): Uint8Array =>
     new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -18,10 +18,12 @@ export class SnapshotBuilder<S extends SchemaShape = SchemaShape> {
         strings?: StringInterner,
     ) {
         this.strings = strings ?? new StringInterner();
-        const ctx: BuilderContext = { strings: this.strings };
 
         const builders: Record<string, unknown> = {};
         for (const entry of this.compiled.layout) {
+            // One context per field so a builder can name itself in an error —
+            // a RangeError then points at the field, at the push that caused it.
+            const ctx: BuilderContext = { strings: this.strings, name: entry.name };
             builders[entry.name] = entry.field.createBuilder(ctx);
         }
 

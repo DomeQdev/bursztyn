@@ -141,13 +141,13 @@ without someone deciding what the new field contains.
 
 ```json
 // bursztyn.config.json
-{ "schema": "./src/schema.ts", "out": "./bursztyn" }
+{ "schema": "./src/schema.ts", "out": "./amber" }
 ```
 
 ```ts
 // src/schema.ts
 import { defineSchema, /* … */ } from "bursztyn";
-import migrations from "../bursztyn";
+import migrations from "../amber";
 
 export const fields = { strings: stringTable(), stopId: stringRefArray(), /* … */ };
 export const schema = defineSchema({ fields, migrations });
@@ -155,8 +155,18 @@ export const schema = defineSchema({ fields, migrations });
 
 ```
 $ bursztyn generate
-✓ Initialised ./bursztyn at version 0
+✓ Initialised ./amber at version 0
 ```
+
+The CLI has to import your schema module, so a `.ts` schema needs a runtime that reads TypeScript —
+Bun, Deno, or Node ≥ 22.18. The published binary starts under Node; if Node cannot load the module
+it re-runs itself under `bun` from PATH, so a `.ts` schema works from an npm script either way.
+
+Do not name `out` after the package. A folder called `bursztyn/` shadows the package for bare
+specifiers: `import { defineSchema } from "bursztyn"` can resolve to your migrations folder, and
+`bun bursztyn generate` runs the generated bundle instead of the CLI — printing nothing and exiting
+0, which reads as "the command did nothing". The default `./amber` stays out of the way; the CLI
+warns if you point `out` at the colliding name anyway.
 
 Now add a field to `fields` and run your app:
 
@@ -175,7 +185,7 @@ $ bursztyn generate
   + stopBearing num:Uint16Array
 
   ⚠ 1 field needs data.
-  Open ./bursztyn/0001_add_stop_bearing.ts, fill in up(), then delete the names from pending.
+  Open ./amber/0001_add_stop_bearing.ts, fill in up(), then delete the names from pending.
 ```
 
 The generated file already knows the field's definition, what it can carry over, and where your data
@@ -205,7 +215,7 @@ removals need no editing at all — the CLI writes them complete and `bursztyn g
 ### What lands in the folder
 
 ```
-bursztyn/
+amber/
   index.ts                      generated bundle — imported by your schema
   0001_add_stop_bearing.ts      one file per version, yours to fill in
   meta/

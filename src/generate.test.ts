@@ -44,7 +44,7 @@ const initial = (fields: any): { snapshot: SchemaSnapshot; journal: Journal } =>
         compiled: defineSchema({ fields }).compiled,
         journal: emptyJournal(),
         previous: null,
-        out: "./bursztyn",
+        out: "./amber",
         importFrom: "bursztyn",
         timestamp: TIMESTAMP,
     });
@@ -65,7 +65,7 @@ const generate = (fields: any, renames?: Record<string, string>) => {
         compiled: defineSchema({ fields }).compiled,
         journal,
         previous: snapshot,
-        out: "./bursztyn",
+        out: "./amber",
         importFrom: "bursztyn",
         renames,
         timestamp: TIMESTAMP,
@@ -124,7 +124,7 @@ describe("planGeneration", () => {
             compiled: defineSchema({ fields: baseFields }).compiled,
             journal: emptyJournal(),
             previous: null,
-            out: "./bursztyn",
+            out: "./amber",
             importFrom: "bursztyn",
             timestamp: TIMESTAMP,
         });
@@ -132,9 +132,9 @@ describe("planGeneration", () => {
         expect(result.status).toBe("initial");
         expect(result.version).toBe(0);
         expect(result.files.map((file) => file.path)).toEqual([
-            "./bursztyn/meta/0000_snapshot.json",
-            "./bursztyn/meta/_journal.json",
-            "./bursztyn/index.ts",
+            "./amber/meta/0000_snapshot.json",
+            "./amber/meta/_journal.json",
+            "./amber/index.ts",
         ]);
     });
 

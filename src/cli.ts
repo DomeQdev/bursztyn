@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { enforcement } from "./bundle.ts";
 import { diffManifest, inspect, isSnapshot } from "./format.ts";
 import { planGeneration, renameCandidates, type SchemaChange } from "./generate.ts";
@@ -26,6 +28,7 @@ const green = (text: string) => paint("32", text);
 const yellow = (text: string) => paint("33", text);
 
 const write = (text: string) => process.stdout.write(`${text}\n`);
+const warn = (text: string) => process.stderr.write(`${yellow("!")} ${text}\n`);
 const fail = (text: string): never => {
     process.stderr.write(`${red("✗")} ${text}\n`);
     process.exit(1);
@@ -39,7 +42,7 @@ const USAGE = `${bold("bursztyn")} — schema snapshots with generated migration
 
 Options:
   --schema <path>   schema module (default: bursztyn.config.json → "schema")
-  --out <dir>       migrations folder (default: ./bursztyn)
+  --out <dir>       migrations folder (default: ./amber)
   --config <path>   config file (default: ./bursztyn.config.json)
 `;
 
@@ -61,6 +64,12 @@ const flags = (name: string): string[] =>
         )
         .filter((value): value is string => value !== undefined);
 
+// Deliberately not "./bursztyn": a folder named after the package shadows the
+// package for bare-specifier resolution.
+const DEFAULT_OUT = "./amber";
+
+const REEXEC_FLAG = "BURSZTYN_REEXEC";
+
 interface Config {
     schema: string;
     out: string;
@@ -81,16 +90,36 @@ const loadConfig = async (): Promise<Config> => {
     if (!schema) {
         fail(
             `No schema module configured.\n\n  Create ${bold("bursztyn.config.json")}:\n\n` +
-                `    { "schema": "./src/schema.ts", "out": "./bursztyn" }\n\n` +
+                `    { "schema": "./src/schema.ts", "out": "./amber" }\n\n` +
                 `  …or pass ${bold("--schema <path>")}.`,
         );
     }
 
     return {
         schema: schema!,
-        out: flag("out") ?? file.out ?? "./bursztyn",
+        out: flag("out") ?? file.out ?? DEFAULT_OUT,
         importFrom: file.importFrom ?? "bursztyn",
     };
+};
+
+/**
+ * A folder named after the package shadows it for bare specifiers: the schema's
+ * own `from "bursztyn"` can land on the migrations folder, and `bun bursztyn
+ * generate` runs the generated bundle instead of this CLI — printing nothing
+ * and exiting 0, which reads as the command having done nothing.
+ *
+ * Emitted before the schema is loaded, because the usual symptom is that the
+ * schema fails to load. A process we handed over to stays quiet so the warning
+ * is not printed twice.
+ */
+const warnIfOutShadowsPackage = (out: string) => {
+    if (basename(resolve(out)) !== "bursztyn" || process.env[REEXEC_FLAG] === "1") return;
+
+    warn(
+        `${bold(out)} has the same name as the package, so ${bold("bun bursztyn …")} runs the\n` +
+            `  generated bundle instead of this CLI, and a schema importing ${bold('"bursztyn"')} can\n` +
+            `  resolve to it. Rename ${bold("out")} — ${bold(DEFAULT_OUT)} is the default.\n`,
+    );
 };
 
 const ensureBundleStub = async (out: string, importFrom: string) => {
@@ -106,21 +135,72 @@ const ensureBundleStub = async (out: string, importFrom: string) => {
     );
 };
 
+
+/** Bun as PATH holds it — `bun.exe`, or a `bun.cmd` shim if it came from npm. */
+const findBun = (): string | null => {
+    const extensions =
+        process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
+
+    for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+        if (dir.length === 0) continue;
+        for (const extension of extensions) {
+            const candidate = join(dir, `bun${extension}`);
+            if (existsSync(candidate)) return candidate;
+        }
+    }
+
+    return null;
+};
+
+/**
+ * Hand the whole invocation to Bun and exit with whatever it returns.
+ *
+ * This CLI ships with a `#!/usr/bin/env node` shebang, and the bin shims a
+ * package manager writes — `bursztyn.cmd` on Windows especially — hardcode
+ * `node`. So `bun bursztyn` and `bunx bursztyn` both still start Node, which
+ * cannot import a TypeScript schema module. Telling the user to "run it with
+ * Bun" was advice they had usually already followed.
+ */
+const rerunUnderBun = (path: string, cause: unknown): never => {
+    const bun = process.env[REEXEC_FLAG] === "1" ? null : findBun();
+
+    if (bun) {
+        const argv = [fileURLToPath(import.meta.url), ...args];
+        const env = { ...process.env, [REEXEC_FLAG]: "1" };
+
+        // Node refuses to execute .cmd/.bat directly, so an npm-installed Bun
+        // has to go through the shell. stdio is inherited either way, so the
+        // rename prompt still reaches the terminal and the exit code survives
+        // for CI.
+        const quote = (value: string) => `"${value.replace(/"/g, '\\"')}"`;
+        const result = /\.(cmd|bat)$/i.test(bun)
+            ? spawnSync(quote(bun), argv.map(quote), { stdio: "inherit", env, shell: true })
+            : spawnSync(bun, argv, { stdio: "inherit", env });
+
+        if (!result.error) process.exit(result.status ?? 0);
+    }
+
+    return fail(
+        `Could not import ${path}.\n\n` +
+            `  Node cannot import TypeScript, and ${bold("bun")} is not on PATH to do it instead.\n\n` +
+            `  Install Bun, or point ${bold("schema")} at a module Node can load.\n\n` +
+            `  ${dim(String(cause))}`,
+    );
+};
+
 const loadSchema = async (path: string): Promise<Schema<any>> => {
     enforcement.enabled = false;
 
     const absolute = isAbsolute(path) ? path : resolve(path);
+    const nodeCannotLoadIt = absolute.endsWith(".ts") && !("Bun" in globalThis) && !("Deno" in globalThis);
     let module: Record<string, unknown>;
 
     try {
         module = (await import(pathToFileURL(absolute).href)) as Record<string, unknown>;
     } catch (error) {
-        if (absolute.endsWith(".ts") && !("Bun" in globalThis) && !("Deno" in globalThis)) {
-            return fail(
-                `Could not import ${path}.\n\n  Node cannot import TypeScript directly — run the CLI with Bun:\n\n` +
-                    `    bun bursztyn ${args.join(" ")}\n\n  ${dim(String(error))}`,
-            );
-        }
+        // Recent Node strips types on its own, so this is attempted first and
+        // only handed over when it actually fails.
+        if (nodeCannotLoadIt) return rerunUnderBun(path, error);
         return fail(`Could not import ${path}\n\n  ${String(error)}`);
     }
 
@@ -178,6 +258,7 @@ const describeChangeLines = (change: SchemaChange): string[] => {
 
 const runGenerate = async () => {
     const config = await loadConfig();
+    warnIfOutShadowsPackage(config.out);
     await ensureBundleStub(config.out, config.importFrom);
     const schema = await loadSchema(config.schema);
     const journal = await readJournal(config.out);
@@ -268,6 +349,7 @@ const runGenerate = async () => {
 
 const runStatus = async () => {
     const config = await loadConfig();
+    warnIfOutShadowsPackage(config.out);
     await ensureBundleStub(config.out, config.importFrom);
     const schema = await loadSchema(config.schema);
     const journal = await readJournal(config.out);

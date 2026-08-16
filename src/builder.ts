@@ -8,7 +8,7 @@ const asBytes = (data: AnyTypedArray): Uint8Array =>
     new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 
 export class SnapshotBuilder<S extends SchemaShape = SchemaShape> {
-    public readonly builders: Builders<S> & Record<string, any>;
+    public readonly builders: Builders<S>;
     public readonly strings: StringInterner;
     private readonly carried = new Map<string, Uint8Array[]>();
 
@@ -25,7 +25,7 @@ export class SnapshotBuilder<S extends SchemaShape = SchemaShape> {
             builders[entry.name] = entry.field.createBuilder(ctx);
         }
 
-        this.builders = builders as Builders<S> & Record<string, any>;
+        this.builders = builders as Builders<S>;
     }
 
     carry(name: string, sections: Uint8Array[]) {

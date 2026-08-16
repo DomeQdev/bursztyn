@@ -377,7 +377,7 @@ const runStep = async <S extends SchemaShape>(
 
         await migration.up({
             previous,
-            builders: builder.builders,
+            builders: builder.builders as Builders<S> & Record<string, any>,
             strings: builder.strings,
             carried: new Set(report.carried),
             log: options.log ?? (() => {}),

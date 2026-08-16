@@ -124,8 +124,12 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
     }
 
     matches(source: SnapshotSource): boolean {
-        const header = readHeader(source);
-        return header.schemaHash === this.compiled.hash && header.schemaVersion === this.version;
+        try {
+            const header = readHeader(source);
+            return header.schemaHash === this.compiled.hash && header.schemaVersion === this.version;
+        } catch {
+            return false;
+        }
     }
 
     inspect(source: SnapshotSource): SnapshotInfo {

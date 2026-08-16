@@ -1,4 +1,4 @@
-import type { StringInterner, StringReader } from "./strings";
+import type { StringInterner, StringReader } from "./strings.js";
 
 export type AnyTypedArray =
     | Int8Array

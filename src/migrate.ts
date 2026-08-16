@@ -1,10 +1,10 @@
-import { SnapshotBuilder } from "./builder";
+import { SnapshotBuilder } from "./builder.js";
 import {
     BursztynError,
     CarryConflictError,
     MigrationDataLossError,
     MigrationPathError,
-} from "./errors";
+} from "./errors.js";
 import {
     createReadersFromLayout,
     layoutFromManifest,
@@ -12,11 +12,11 @@ import {
     sectionBytes,
     toBytes,
     type SnapshotHeader,
-} from "./format";
-import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout";
-import { fieldFromSignature } from "./registry";
-import { StringInterner, STRING_TABLE_SIGNATURE, type StringReader } from "./strings";
-import type { AnyTypedArray, Builders, Field, SchemaShape, SnapshotSource } from "./types";
+} from "./format.js";
+import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
+import { fieldFromSignature } from "./registry.js";
+import { StringInterner, STRING_TABLE_SIGNATURE, type StringReader } from "./strings.js";
+import type { AnyTypedArray, Builders, Field, SchemaShape, SnapshotSource } from "./types.js";
 
 export interface PreviousSnapshot {
     readonly version: number;
@@ -38,15 +38,22 @@ export interface MigrationContext<S extends SchemaShape> {
 
 export type FieldDefinitions = string[] | Record<string, Field<any, any>>;
 
-export interface Migration<S extends SchemaShape = SchemaShape> {
-    from: number;
-    to: number;
+export interface MigrationStep<S extends SchemaShape = SchemaShape> {
+    id: string;
     description?: string;
     defines?: FieldDefinitions;
     renames?: Record<string, string>;
     drops?: string[];
     rebuilds?: string[];
+    pending?: string[];
     up?(ctx: MigrationContext<S>): void | Promise<void>;
+}
+
+export interface Migration<S extends SchemaShape = SchemaShape>
+    extends Omit<MigrationStep<S>, "id"> {
+    id?: string;
+    from: number;
+    to: number;
 }
 
 export interface MigrationStepReport {
@@ -133,7 +140,7 @@ export const resolveChain = <S extends SchemaShape>(
     return chain;
 };
 
-const stepName = (migration: Migration<any>) => `${migration.from} -> ${migration.to}`;
+const stepName = (migration: Migration<any>) => migration.id ?? `${migration.from} -> ${migration.to}`;
 
 const remapSignature = (signature: string, renames: Record<string, string>): string => {
     if (!signature.startsWith("hashLookup:")) return signature;

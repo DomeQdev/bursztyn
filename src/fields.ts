@@ -1,7 +1,7 @@
-import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types";
-import type { AnyTypedArray } from "./types";
-import { hashState, hashString, hashToBigint, splitHash } from "./hash";
-import { StringInterner, StringReader } from "./strings";
+import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types.js";
+import type { AnyTypedArray } from "./types.js";
+import { hashState, hashString, hashToBigint, splitHash } from "./hash.js";
+import { StringInterner, StringReader } from "./strings.js";
 import {
     assertNumericRange,
     ColumnStore,
@@ -13,7 +13,7 @@ import {
     type ColumnView,
     type ColumnReadValue,
     type ColumnWriteValue,
-} from "./columns";
+} from "./columns.js";
 
 export class NumArrayBuilder {
     public readonly values: number[] = [];

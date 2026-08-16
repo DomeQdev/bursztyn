@@ -1,8 +1,8 @@
-import { FormatError, type FieldDiff } from "./errors";
-import type { CompiledSchema, FieldLayout } from "./layout";
-import { fieldFromSignature } from "./registry";
-import { STRING_TABLE_SIGNATURE, StringReader } from "./strings";
-import type { AnyTypedArray, ReaderContext, Readers, SchemaShape, SnapshotSource } from "./types";
+import { FormatError, type FieldDiff } from "./errors.js";
+import type { CompiledSchema, FieldLayout } from "./layout.js";
+import { fieldFromSignature } from "./registry.js";
+import { STRING_TABLE_SIGNATURE, StringReader } from "./strings.js";
+import type { AnyTypedArray, ReaderContext, Readers, SchemaShape, SnapshotSource } from "./types.js";
 
 // [0..4)   magic "BRSZ"          [4..6)   format version   [6..8)   flags
 // [8..16)  schema hash u64       [16..20) schema version   [20..24) section count

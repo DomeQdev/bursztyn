@@ -1,5 +1,13 @@
-import { SnapshotBuilder } from "./builder";
-import { BursztynError, SchemaMismatchError, type FieldDiff } from "./errors";
+import { SnapshotBuilder } from "./builder.js";
+import {
+    enforcement,
+    isBundle,
+    MissingMigrationsError,
+    SchemaDriftError,
+    UnfinishedMigrationError,
+    type MigrationBundle,
+} from "./bundle.js";
+import { BursztynError, SchemaMismatchError, type FieldDiff } from "./errors.js";
 import {
     createReaders,
     diffManifest,
@@ -7,23 +15,24 @@ import {
     readHeader,
     toBytes,
     type SnapshotInfo,
-} from "./format";
-import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout";
+} from "./format.js";
+import { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
 import {
     migrateSnapshot,
     resolveChain,
     type MigrateOptions,
     type Migration,
     type MigrationReport,
+    type MigrationStep,
     type MigrationTarget,
-} from "./migrate";
-import { STRING_TABLE_SIGNATURE } from "./strings";
-import type { NoInference, Readers, SchemaShape, SnapshotSource } from "./types";
+} from "./migrate.js";
+import { STRING_TABLE_SIGNATURE } from "./strings.js";
+import type { NoInference, Readers, SchemaShape, SnapshotSource } from "./types.js";
 
 export interface SchemaDefinition<S extends SchemaShape> {
     fields: S;
     version?: number;
-    migrations?: Migration<NoInference<S>>[];
+    migrations?: Migration<NoInference<S>>[] | MigrationBundle<NoInference<S>>;
 }
 
 export interface OpenOptions extends MigrateOptions {
@@ -44,9 +53,20 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
 
     constructor(definition: SchemaDefinition<S>) {
         this.fields = definition.fields;
-        this.version = definition.version ?? 0;
-        this.migrations = definition.migrations ?? [];
         this.compiled = compileSchema(definition.fields);
+
+        const declared = definition.migrations;
+        const bundle = isBundle(declared) ? declared : undefined;
+        this.migrations = isBundle(declared)
+            ? (declared.migrations as Migration<S>[])
+            : (declared ?? []);
+
+        if (bundle && definition.version !== undefined) {
+            throw new BursztynError(
+                "`version` is managed by the bursztyn CLI — remove it from defineSchema().",
+            );
+        }
+        this.version = bundle ? bundle.version : (definition.version ?? 0);
 
         const stringTables = this.compiled.layout.filter(
             (entry) => entry.signature === STRING_TABLE_SIGNATURE,
@@ -56,6 +76,8 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
                 `A schema needs exactly one stringTable() field, found ${stringTables.length}.`,
             );
         }
+
+        if (bundle && enforcement.enabled) this.enforce(bundle);
 
         if (this.migrations.length > 0) {
             const landings = this.migrations.map((migration) => migration.to);
@@ -69,6 +91,20 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
             const earliest = Math.min(...this.migrations.map((migration) => migration.from));
             resolveChain(this.migrations, earliest, this.version);
         }
+    }
+
+    private enforce(bundle: MigrationBundle) {
+        if (bundle.hash === 0n && bundle.migrations.length === 0) throw new MissingMigrationsError();
+
+        if (bundle.hash !== this.compiled.hash) {
+            throw new SchemaDriftError(
+                bundle.hash,
+                this.compiled.hash,
+                diffManifest(bundle.manifest, this.compiled.layout),
+            );
+        }
+
+        if (bundle.unfinished.length > 0) throw new UnfinishedMigrationError(bundle.unfinished);
     }
 
     get hash(): bigint {
@@ -153,4 +189,8 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
 export const defineSchema = <S extends SchemaShape>(definition: SchemaDefinition<S>): Schema<S> =>
     new Schema(definition);
 
-export const migration = <S extends SchemaShape>(spec: Migration<S>): Migration<S> => spec;
+export function migration<S extends SchemaShape>(spec: Migration<S>): Migration<S>;
+export function migration<S extends SchemaShape>(spec: MigrationStep<S>): MigrationStep<S>;
+export function migration(spec: unknown): unknown {
+    return spec;
+}

@@ -1,4 +1,4 @@
-import type { BuilderContext, Field, FieldSection, ReaderContext } from "./types";
+import type { BuilderContext, Field, FieldSection, ReaderContext } from "./types.js";
 
 const HAS_BUFFER = typeof Buffer !== "undefined";
 const DECODER = new TextDecoder();

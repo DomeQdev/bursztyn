@@ -1,8 +1,8 @@
-import { BursztynError } from "./errors";
-import { assembleSnapshot, type EmittedField } from "./format";
-import type { CompiledSchema } from "./layout";
-import { StringInterner } from "./strings";
-import type { AnyTypedArray, Builders, BuilderContext, SchemaShape } from "./types";
+import { BursztynError } from "./errors.js";
+import { assembleSnapshot, type EmittedField } from "./format.js";
+import type { CompiledSchema } from "./layout.js";
+import { StringInterner } from "./strings.js";
+import type { AnyTypedArray, Builders, BuilderContext, SchemaShape } from "./types.js";
 
 const asBytes = (data: AnyTypedArray): Uint8Array =>
     new Uint8Array(data.buffer, data.byteOffset, data.byteLength);

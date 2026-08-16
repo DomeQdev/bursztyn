@@ -1,5 +1,5 @@
-import type { AnyTypedArray, ReaderContext, TypedArrayConstructor } from "./types";
-import type { StringInterner, StringReader } from "./strings";
+import type { AnyTypedArray, ReaderContext, TypedArrayConstructor } from "./types.js";
+import type { StringInterner, StringReader } from "./strings.js";
 
 const INTEGER_RANGES: Record<string, [min: number, max: number]> = {
     Int8Array: [-128, 127],

@@ -1,5 +1,5 @@
-import { hashStringToBigint } from "./hash";
-import type { Field, SchemaShape } from "./types";
+import { hashStringToBigint } from "./hash.js";
+import type { Field, SchemaShape } from "./types.js";
 
 export interface FieldLayout {
     name: string;

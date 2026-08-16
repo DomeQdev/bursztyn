@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "id": "0001_add_stop_bearing",
+  "hash": "18108491459219628012",
+  "fields": [
+    [
+      "strings",
+      "stringTable",
+      2
+    ],
+    [
+      "city",
+      "singleStringRef",
+      1
+    ],
+    [
+      "stopLookup",
+      "hashLookup:stopId",
+      3
+    ],
+    [
+      "stopId",
+      "stringRefArray",
+      1
+    ],
+    [
+      "stopName",
+      "stringRefArray",
+      1
+    ],
+    [
+      "stopLat",
+      "num:Int32Array",
+      1
+    ],
+    [
+      "stopRoutes",
+      "bucketArray:Uint32Array:1",
+      2
+    ],
+    [
+      "stopBearing",
+      "num:Uint16Array",
+      1
+    ]
+  ]
+}

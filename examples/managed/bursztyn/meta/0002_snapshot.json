@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "id": "0002_rename_stop_name_to_stop_label",
+  "hash": "10157662540724366447",
+  "fields": [
+    [
+      "strings",
+      "stringTable",
+      2
+    ],
+    [
+      "city",
+      "singleStringRef",
+      1
+    ],
+    [
+      "stopLookup",
+      "hashLookup:stopId",
+      3
+    ],
+    [
+      "stopId",
+      "stringRefArray",
+      1
+    ],
+    [
+      "stopLabel",
+      "stringRefArray",
+      1
+    ],
+    [
+      "stopLat",
+      "num:Int32Array",
+      1
+    ],
+    [
+      "stopRoutes",
+      "bucketArray:Uint32Array:1",
+      2
+    ],
+    [
+      "stopBearing",
+      "num:Uint16Array",
+      1
+    ]
+  ]
+}

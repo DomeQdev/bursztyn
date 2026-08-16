@@ -1,7 +1,40 @@
-export { defineSchema, migration, Schema } from "./schema";
-export type { OpenOptions, OpenResult, SchemaDefinition } from "./schema";
+export { defineSchema, migration, Schema } from "./schema.js";
+export type { OpenOptions, OpenResult, SchemaDefinition } from "./schema.js";
 
-export { SnapshotBuilder } from "./builder";
+export {
+    defineMigrations,
+    isBundle,
+    todo,
+    MissingMigrationsError,
+    SchemaDriftError,
+    UnfinishedMigrationError,
+    type MigrationBundle,
+    type MigrationBundleInput,
+} from "./bundle.js";
+
+export {
+    describeChange,
+    isEmptyChange,
+    planGeneration,
+    renameCandidates,
+    renderField,
+    suggestName,
+    type GeneratedFile,
+    type GenerateOptions,
+    type GenerateResult,
+    type SchemaChange,
+} from "./generate.js";
+
+export {
+    emptyJournal,
+    parseJournal,
+    snapshotManifest,
+    type Journal,
+    type JournalEntry,
+    type SchemaSnapshot,
+} from "./journal.js";
+
+export { SnapshotBuilder } from "./builder.js";
 
 export {
     migrateSnapshot,
@@ -10,10 +43,11 @@ export {
     type Migration,
     type MigrationContext,
     type MigrationReport,
+    type MigrationStep,
     type MigrationStepReport,
     type MigrationTarget,
     type PreviousSnapshot,
-} from "./migrate";
+} from "./migrate.js";
 
 export {
     assembleSnapshot,
@@ -31,9 +65,9 @@ export {
     type ManifestEntry,
     type SnapshotHeader,
     type SnapshotInfo,
-} from "./format";
+} from "./format.js";
 
-export { compileSchema, type CompiledSchema, type FieldLayout } from "./layout";
+export { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.js";
 
 export {
     openSnapshotFile,
@@ -41,7 +75,7 @@ export {
     writeSnapshotFile,
     type OpenFileOptions,
     type ReadFileOptions,
-} from "./io";
+} from "./io.js";
 
 export {
     BursztynError,
@@ -53,9 +87,9 @@ export {
     SchemaMismatchError,
     UnknownSignatureError,
     type FieldDiff,
-} from "./errors";
+} from "./errors.js";
 
-export { StringInterner, StringReader, stringTable } from "./strings";
+export { StringInterner, StringReader, stringTable } from "./strings.js";
 
 export {
     bucketArray,
@@ -87,7 +121,7 @@ export {
     TrigramIndexBuilder,
     TrigramIndexReader,
     type MultiBucketArrayReader,
-} from "./fields";
+} from "./fields.js";
 
 export {
     assertNumericRange,
@@ -109,11 +143,11 @@ export {
     type ColumnWriteValue,
     type NumColumnSpec,
     type StringRefColumnSpec,
-} from "./columns";
+} from "./columns.js";
 
-export { fieldFromSignature } from "./registry";
+export { fieldFromSignature } from "./registry.js";
 
-export { hashString, hashStringToBigint, splitHash } from "./hash";
+export { hashString, hashStringToBigint, splitHash } from "./hash.js";
 
 export type {
     AnyTypedArray,
@@ -128,4 +162,4 @@ export type {
     SchemaShape,
     SnapshotSource,
     TypedArrayConstructor,
-} from "./types";
+} from "./types.js";

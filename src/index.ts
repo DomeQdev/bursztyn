@@ -52,6 +52,7 @@ export {
 export {
     assembleSnapshot,
     createReaders,
+    createReadersFromHeader,
     createReadersFromLayout,
     diffManifest,
     inspect,
@@ -72,6 +73,7 @@ export { compileSchema, type CompiledSchema, type FieldLayout } from "./layout.t
 export {
     openSnapshotFile,
     readSnapshotFile,
+    readSnapshotHeaderFile,
     writeSnapshotFile,
     type OpenFileOptions,
     type ReadFileOptions,
@@ -98,6 +100,7 @@ export {
     multiBucketArray,
     numArray,
     pairIndex,
+    pairIndexLegacy,
     rawBytes,
     singleStringRef,
     sortedU32Index,
@@ -147,7 +150,7 @@ export {
 
 export { fieldFromSignature } from "./registry.ts";
 
-export { hashString, hashStringToBigint, splitHash } from "./hash.ts";
+export { fmix32, hashString, hashStringToBigint, splitHash } from "./hash.ts";
 
 export type {
     AnyTypedArray,

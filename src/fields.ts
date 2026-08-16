@@ -1,6 +1,6 @@
 import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types.ts";
 import type { AnyTypedArray } from "./types.ts";
-import { hashChars, hashState, hashString, splitHash } from "./hash.ts";
+import { fmix32, hashChars, hashState, hashString, splitHash } from "./hash.ts";
 import { NumberBuffer, U32Buffer } from "./growable.ts";
 import { StringInterner, StringReader } from "./strings.ts";
 import {
@@ -344,7 +344,10 @@ export class TrigramIndexBuilder {
 
         let bucket = byLo.get(lo);
         if (bucket === undefined) {
-            bucket = { lo, hi: hashHigh, ids: new U32Buffer(), last: -1 };
+            // A trigram bucket almost always holds a handful of postings, so it
+            // starts at a capacity that fits one rather than at zero — which
+            // cost every bucket an empty array plus the first growth.
+            bucket = { lo, hi: hashHigh, ids: new U32Buffer(4), last: -1 };
             byLo.set(lo, bucket);
             this.buckets.push(bucket);
         }
@@ -418,6 +421,12 @@ export class TrigramIndexReader {
     private matches: Map<number, number> | null = null;
     private generation = 0;
 
+    // The ids this query scored, so the result sweep visits only them. Kept on
+    // the reader and refilled per search: a fresh array per query handed the
+    // collector one more thing to reclaim on every keystroke of a type-ahead.
+    private touched = new Uint32Array(0);
+    private touchedCount = 0;
+
     constructor(
         private keysLow: Uint32Array,
         private keysHigh: Uint32Array,
@@ -445,7 +454,7 @@ export class TrigramIndexReader {
 
         const ptr = this.ptr;
         const data = this.data;
-        const touched: number[] = [];
+        this.touchedCount = 0;
         let maxScore = 0;
 
         for (let t = 0; t < trigrams; t++) {
@@ -465,12 +474,12 @@ export class TrigramIndexReader {
                     if (stamp![id] !== generation) {
                         stamp![id] = generation;
                         scores[id] = 0;
-                        touched.push(id);
+                        this.touch(id);
                     }
                     score = ++scores[id];
                 } else {
                     score = (matches!.get(id) ?? 0) + 1;
-                    if (score === 1) touched.push(id);
+                    if (score === 1) this.touch(id);
                     matches!.set(id, score);
                 }
 
@@ -482,7 +491,8 @@ export class TrigramIndexReader {
         const cutoff = Math.max(minMatches, maxScore * (opts.dynamicCutoffRatio ?? 0.7));
         const results: { idx: number; score: number }[] = [];
 
-        for (let i = 0; i < touched.length; i++) {
+        const touched = this.touched;
+        for (let i = 0; i < this.touchedCount; i++) {
             const idx = touched[i];
             const score = scores !== null ? scores[idx] : matches!.get(idx)!;
             if (score >= cutoff) results.push({ idx, score });
@@ -495,6 +505,15 @@ export class TrigramIndexReader {
         }
 
         return results;
+    }
+
+    private touch(id: number) {
+        if (this.touchedCount === this.touched.length) {
+            const grown = new Uint32Array(this.touched.length === 0 ? 64 : this.touched.length * 2);
+            grown.set(this.touched);
+            this.touched = grown;
+        }
+        this.touched[this.touchedCount++] = id;
     }
 
     /**
@@ -575,6 +594,66 @@ class TrigramIndexField implements Field<TrigramIndexBuilder, TrigramIndexReader
 
 export const trigramIndex = () => new TrigramIndexField();
 
+// Below this a comparator sort wins: three counting passes have to allocate
+// their histogram and walk the data three times regardless of how little of it
+// there is.
+const RADIX_MIN_SIZE = 512;
+
+/**
+ * The permutation that sorts `keys` ascending, ties broken by original index —
+ * exactly what `(a, b) => keys[a] - keys[b] || a - b` produces, without calling
+ * into JS once per comparison.
+ *
+ * LSD radix over 11 + 11 + 10 bits. The keys ride along beside the indices so
+ * every pass reads both sequentially instead of gathering through the
+ * permutation, and a pass whose digit is constant — the top bits of a small
+ * key space, which is the usual case — is skipped outright.
+ */
+const sortPermutationByKey = (keys: Uint32Array, size: number): Uint32Array => {
+    let order = new Uint32Array(size);
+    let digits = new Uint32Array(size);
+    for (let i = 0; i < size; i++) {
+        order[i] = i;
+        digits[i] = keys[i];
+    }
+
+    let orderOut = new Uint32Array(size);
+    let digitsOut = new Uint32Array(size);
+    const counts = new Uint32Array(2048);
+
+    for (let shift = 0; shift < 32; shift += 11) {
+        const buckets = shift === 22 ? 1024 : 2048;
+        const mask = buckets - 1;
+
+        counts.fill(0, 0, buckets);
+        for (let i = 0; i < size; i++) counts[(digits[i] >>> shift) & mask]++;
+        if (counts[(digits[0] >>> shift) & mask] === size) continue;
+
+        let running = 0;
+        for (let b = 0; b < buckets; b++) {
+            const count = counts[b];
+            counts[b] = running;
+            running += count;
+        }
+
+        for (let i = 0; i < size; i++) {
+            const digit = digits[i];
+            const slot = counts[(digit >>> shift) & mask]++;
+            orderOut[slot] = order[i];
+            digitsOut[slot] = digit;
+        }
+
+        let swap = order;
+        order = orderOut;
+        orderOut = swap;
+        swap = digits;
+        digits = digitsOut;
+        digitsOut = swap;
+    }
+
+    return order;
+};
+
 export class SortedU32IndexBuilder {
     private readonly keys = new U32Buffer();
     private readonly values = new U32Buffer();
@@ -592,9 +671,14 @@ export class SortedU32IndexBuilder {
         // Sorting a permutation keeps the pairs as two u32 columns throughout.
         // Sorting `{ key, value }` records meant one object per entry plus a
         // pointer array the same size again, all of it garbage afterwards.
-        const order = new Uint32Array(size);
-        for (let i = 0; i < size; i++) order[i] = i;
-        order.sort((a, b) => keys[a] - keys[b] || a - b);
+        let order: Uint32Array;
+        if (size >= RADIX_MIN_SIZE) {
+            order = sortPermutationByKey(keys, size);
+        } else {
+            order = new Uint32Array(size);
+            for (let i = 0; i < size; i++) order[i] = i;
+            order.sort((a, b) => keys[a] - keys[b] || a - b);
+        }
 
         const outKeys = new Uint32Array(size);
         const outValues = new Uint32Array(size);
@@ -712,9 +796,7 @@ export class BucketArrayBuilder<S extends ColumnSpec> {
             return;
         }
 
-        const arr = value as ArrayLike<number>;
-        store.reserve(this.stride);
-        for (let s = 0; s < this.stride; s++) store.push(arr[s] ?? 0);
+        store.pushStride(value as ArrayLike<number>, this.stride);
     }
 
     endBucket() {
@@ -982,17 +1064,44 @@ class KeyedIndexField<S extends ColumnSpec> implements Field<KeyedIndexBuilder<S
 
 export const keyedIndex = <S extends ColumnSpec>(spec: S) => new KeyedIndexField(spec);
 
+/**
+ * The (a, b) pair as the two halves of a table key.
+ *
+ * `fmix32` is murmur's avalanche and is a bijection, so distinct pairs stay
+ * distinct — a hit on both halves is still an exact match, and `find` needs no
+ * verification column. What it buys is the *placement*: the table probes from
+ * `lo & mask`, and feeding `b` in raw meant a column of structured ids — times
+ * on a minute grid, keys with zeroed low bits — landed on every fourth slot and
+ * clustered under linear probing. `a + 1` keeps the high half off zero so an
+ * ordinary pair never hits the empty-slot sentinel.
+ */
+const pairKey = (a: number, b: number, mixed: boolean): void => {
+    if (mixed) {
+        hashState.lo = fmix32(b >>> 0);
+        hashState.hi = fmix32((a + 1) >>> 0);
+    } else {
+        hashState.lo = b >>> 0;
+        hashState.hi = (a + 1) >>> 0;
+    }
+};
+
 export class PairIndexBuilder<C extends Columns> {
     private lookup = new HashLookupBuilder();
     private store: ColumnStore<C>;
     private count = 0;
 
-    constructor(columns: C, strings: StringInterner, label?: string) {
+    constructor(
+        columns: C,
+        strings: StringInterner,
+        label?: string,
+        private readonly mixed: boolean = true,
+    ) {
         this.store = new ColumnStore(columns, strings, label);
     }
 
     add(a: number, b: number, item: { [K in keyof C]: ColumnWriteValue<C[K]> }) {
-        this.lookup.addSplit(b >>> 0, (a + 1) >>> 0, this.count);
+        pairKey(a, b, this.mixed);
+        this.lookup.addSplit(hashState.lo, hashState.hi, this.count);
         this.store.push(item);
         this.count++;
     }
@@ -1014,13 +1123,15 @@ export class PairIndexReader<C extends Columns> {
         columns: C,
         private views: { [K in keyof C]: ColumnView<C[K]> },
         private strings: StringReader,
+        private readonly mixed: boolean = true,
     ) {
         this.keys = Object.keys(columns);
         this.specs = this.keys.map((key) => columns[key]);
     }
 
     find(a: number, b: number): { [K in keyof C]: ColumnReadValue<C[K]> } | undefined {
-        const idx = this.lookup.findByHashSplit(b >>> 0, (a + 1) >>> 0);
+        pairKey(a, b, this.mixed);
+        const idx = this.lookup.findByHashSplit(hashState.lo, hashState.hi);
         if (idx === undefined) return undefined;
 
         const views = this.views as Record<string, AnyTypedArray>;
@@ -1035,14 +1146,20 @@ export class PairIndexReader<C extends Columns> {
 
 class PairIndexField<C extends Columns> implements Field<PairIndexBuilder<C>, PairIndexReader<C>> {
     readonly sectionCount: number;
-    constructor(private columns: C) {
+    constructor(
+        private columns: C,
+        private readonly mixed: boolean = true,
+    ) {
         this.sectionCount = 3 + Object.keys(columns).length;
     }
     signature() {
-        return `pairIndex:${columnsSignature(this.columns)}`;
+        // Where the entries land in the table is part of the snapshot, and the
+        // unmixed placement is not the mixed one — so it gets its own name
+        // rather than being read back wrong under the old one.
+        return `${this.mixed ? "pairIndex2" : "pairIndex"}:${columnsSignature(this.columns)}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new PairIndexBuilder(this.columns, ctx.strings, ctx.name);
+        return new PairIndexBuilder(this.columns, ctx.strings, ctx.name, this.mixed);
     }
     finalize(builder: PairIndexBuilder<C>): FieldSection[] {
         const { lookup, columns } = builder.finalize();
@@ -1060,8 +1177,15 @@ class PairIndexField<C extends Columns> implements Field<PairIndexBuilder<C>, Pa
             ctx.view(2, Uint32Array),
         );
         const views = readColumns(this.columns, ctx, 3);
-        return new PairIndexReader(lookup, this.columns, views, ctx.strings);
+        return new PairIndexReader(lookup, this.columns, views, ctx.strings, this.mixed);
     }
 }
 
 export const pairIndex = <C extends Columns>(columns: C) => new PairIndexField(columns);
+
+/**
+ * The pre-`pairIndex2` layout, which keyed the table on the raw pair. Reachable
+ * only through a snapshot's own manifest, so an existing file stays readable
+ * and — more to the point — stays migratable.
+ */
+export const pairIndexLegacy = <C extends Columns>(columns: C) => new PairIndexField(columns, false);

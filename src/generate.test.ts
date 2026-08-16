@@ -90,7 +90,11 @@ describe("renderField", () => {
             ["bucketArray:Uint32Array:1", "bucketArray(u32())"],
             ["keyedIndex:Int32Array:2", "keyedIndex(i32Pair())"],
             ["multiBucketArray:name=strRef,location=Int32Array:2", "multiBucketArray({ name: stringRef(), location: i32Pair() })"],
-            ["pairIndex:from=Uint32Array:1,to=Uint8Array:1", "pairIndex({ from: u32(), to: u8() })"],
+            ["pairIndex2:from=Uint32Array:1,to=Uint8Array:1", "pairIndex({ from: u32(), to: u8() })"],
+            [
+                "pairIndex:from=Uint32Array:1,to=Uint8Array:1",
+                'fieldFromSignature("pairIndex:from=Uint32Array:1,to=Uint8Array:1")',
+            ],
             ["bucketArray:Uint32Array:3", "bucketArray(numColumn(Uint32Array, 3))"],
         ];
 

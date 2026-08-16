@@ -147,15 +147,29 @@ export const readHeader = (source: SnapshotSource): SnapshotHeader => {
         );
     }
 
-    const raw = JSON.parse(
-        DECODER.decode(bytes.subarray(manifestOffset, manifestOffset + manifestLength)),
-    ) as [string, string, number][];
+    // Parsed on demand and kept. Reading a snapshot whose hash already matches
+    // never looks at the manifest — the layout comes from the compiled schema —
+    // so the common path now skips a JSON.parse plus one object per field. The
+    // paths that do need it (migrations, inspect, a mismatch diff) pay once.
+    let manifest: ManifestEntry[] | undefined;
 
     return {
         formatVersion,
         schemaHash: view.getBigUint64(8, true),
         schemaVersion: view.getUint32(16, true),
-        manifest: raw.map(([name, signature, count]) => ({ name, signature, sectionCount: count })),
+        get manifest(): ManifestEntry[] {
+            if (manifest === undefined) {
+                const raw = JSON.parse(
+                    DECODER.decode(bytes.subarray(manifestOffset, manifestOffset + manifestLength)),
+                ) as [string, string, number][];
+                manifest = raw.map(([name, signature, count]) => ({
+                    name,
+                    signature,
+                    sectionCount: count,
+                }));
+            }
+            return manifest;
+        },
         // A view, not a copy. The header check above guarantees an 8-byte
         // aligned byteOffset and the table sits at a fixed 32-byte offset, so
         // it is always safely u32-aligned — opening a snapshot should not have
@@ -263,6 +277,18 @@ export const createReaders = <S extends SchemaShape>(
     return createReadersFromLayout(compiled.layout, readHeader(source)) as Readers<S>;
 };
 
+/**
+ * `createReaders` for a caller that has already read the header — which every
+ * caller inside this library has, to check the hash first. Reading it twice
+ * meant re-validating and re-deriving a header per open.
+ */
+export const createReadersFromHeader = <S extends SchemaShape>(
+    compiled: CompiledSchema<S>,
+    header: SnapshotHeader,
+): Readers<S> => {
+    return createReadersFromLayout(compiled.layout, header) as Readers<S>;
+};
+
 export const diffManifest = (manifest: ManifestEntry[], layout: FieldLayout[]): FieldDiff[] => {
     const diff: FieldDiff[] = [];
     const before = new Map(manifest.map((entry, index) => [entry.name, { entry, index }]));
@@ -306,7 +332,13 @@ export interface SnapshotInfo {
     fields: FieldStat[];
 }
 
-export const inspect = (source: SnapshotSource): SnapshotInfo => {
+/**
+ * Field-by-field sizes. Everything reported lives in the header region — the
+ * fixed header, the section table and the manifest — so `totalBytes` lets a
+ * caller that only mapped that prefix (see `readSnapshotHeaderFile`) report the
+ * real file size without having to hold the payload.
+ */
+export const inspect = (source: SnapshotSource, totalBytes?: number): SnapshotInfo => {
     const header = readHeader(source);
     const fields: FieldStat[] = [];
     let sectionId = 0;
@@ -324,7 +356,7 @@ export const inspect = (source: SnapshotSource): SnapshotInfo => {
         formatVersion: header.formatVersion,
         schemaHash: header.schemaHash,
         schemaVersion: header.schemaVersion,
-        totalBytes: header.bytes.byteLength,
+        totalBytes: totalBytes ?? header.bytes.byteLength,
         fields,
     };
 };

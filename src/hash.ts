@@ -1,6 +1,7 @@
 export const hashState = { lo: 0, hi: 0 };
 
-const fmix32 = (h: number): number => {
+/** Murmur3's finalising avalanche. Exported because index keys need it too. */
+export const fmix32 = (h: number): number => {
     h ^= h >>> 16;
     h = Math.imul(h, 0x85ebca6b);
     h ^= h >>> 13;

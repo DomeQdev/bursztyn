@@ -122,9 +122,7 @@ export class ColumnStore<C extends Columns> {
             if (spec.stride === 1) {
                 store.push(value as number);
             } else {
-                const arr = value as ArrayLike<number>;
-                store.reserve(spec.stride);
-                for (let s = 0; s < spec.stride; s++) store.push(arr[s] ?? 0);
+                store.pushStride(value as ArrayLike<number>, spec.stride);
             }
         }
     }

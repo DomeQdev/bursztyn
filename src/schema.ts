@@ -10,6 +10,7 @@ import {
 import { BursztynError, SchemaMismatchError, type FieldDiff } from "./errors.ts";
 import {
     createReaders,
+    createReadersFromHeader,
     diffManifest,
     inspect,
     readHeader,
@@ -150,7 +151,7 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
             );
         }
 
-        return createReaders(this.compiled, source);
+        return createReadersFromHeader(this.compiled, header);
     }
 
     async migrate(
@@ -166,7 +167,7 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
 
         if (header.schemaHash === this.compiled.hash && header.schemaVersion === this.version) {
             return {
-                readers: createReaders(this.compiled, bytes),
+                readers: createReadersFromHeader(this.compiled, header),
                 bytes,
                 report: { migrated: false, from: header.schemaVersion, to: this.version, steps: [] },
             };

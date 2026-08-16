@@ -78,7 +78,18 @@ export class NumberBuffer {
     /** Bulk append. One capacity check for the whole run instead of one per value. */
     pushMany(values: ArrayLike<number>) {
         const count = values.length;
+        if (count === 0) return;
         this.reserve(count);
+
+        // Two cases make the per-value range check provably redundant: a float
+        // target accepts everything, and a source already of the target type has
+        // been through this exact range once. Both hand the copy to the engine's
+        // native `set` instead of walking the values in JS.
+        if (this.min === -Infinity || values instanceof this.ctor) {
+            (this.data as Uint8Array).set(values as ArrayLike<number> & Uint8Array, this.len);
+            this.len += count;
+            return;
+        }
 
         const data = this.data as Uint8Array;
         const { min, max } = this;
@@ -86,6 +97,30 @@ export class NumberBuffer {
 
         for (let i = 0; i < count; i++) {
             const value = values[i];
+            if (value < min || value > max) {
+                this.len = at;
+                this.reject(value);
+            }
+            data[at++] = value;
+        }
+
+        this.len = at;
+    }
+
+    /**
+     * Append exactly `count` values, padding a short source with zeroes — one
+     * stride of a multi-column entry. `reserve` covers the whole stride, so the
+     * per-value capacity test `push` would repeat is gone.
+     */
+    pushStride(values: ArrayLike<number>, count: number) {
+        this.reserve(count);
+
+        const data = this.data as Uint8Array;
+        const { min, max } = this;
+        let at = this.len;
+
+        for (let s = 0; s < count; s++) {
+            const value = values[s] ?? 0;
             if (value < min || value > max) {
                 this.len = at;
                 this.reject(value);

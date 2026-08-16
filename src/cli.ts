@@ -16,7 +16,7 @@ import {
     type Journal,
     type SchemaSnapshot,
 } from "./journal.ts";
-import { readSnapshotFile } from "./io.ts";
+import { readSnapshotHeaderFile } from "./io.ts";
 import { Schema } from "./schema.ts";
 
 const tty = process.stdout.isTTY === true;
@@ -415,10 +415,12 @@ const runInspect = async () => {
     const file = args[1];
     if (!file) fail("bursztyn inspect <file.brsz>");
 
-    const bytes = await readSnapshotFile(file);
+    // Sizes all come out of the manifest and the section table, so inspecting a
+    // 4 GiB snapshot reads a few kilobytes of it.
+    const { bytes, size } = await readSnapshotHeaderFile(file);
     if (!isSnapshot(bytes)) fail(`${file} is not a bursztyn snapshot.`);
 
-    const info = inspect(bytes);
+    const info = inspect(bytes, size);
     const sort = flag("sort") ?? "bytes";
     const fields = [...info.fields];
 

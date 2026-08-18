@@ -95,17 +95,24 @@ export class Schema<S extends SchemaShape> implements MigrationTarget<S> {
     }
 
     private enforce(bundle: MigrationBundle) {
-        if (bundle.hash === 0n && bundle.migrations.length === 0) throw new MissingMigrationsError();
+        // `bundle.name` is set when the project has several schemas, so every
+        // refusal can say which one it is talking about.
+        if (bundle.hash === 0n && bundle.migrations.length === 0) {
+            throw new MissingMigrationsError(bundle.name);
+        }
 
         if (bundle.hash !== this.compiled.hash) {
             throw new SchemaDriftError(
                 bundle.hash,
                 this.compiled.hash,
                 diffManifest(bundle.manifest, this.compiled.layout),
+                bundle.name,
             );
         }
 
-        if (bundle.unfinished.length > 0) throw new UnfinishedMigrationError(bundle.unfinished);
+        if (bundle.unfinished.length > 0) {
+            throw new UnfinishedMigrationError(bundle.unfinished, bundle.name);
+        }
     }
 
     get hash(): bigint {

@@ -7,12 +7,15 @@ export const enforcement = { enabled: true };
 
 export interface MigrationBundleInput<S extends SchemaShape = SchemaShape> {
     hash: string;
+    /** Which schema this folder tracks — written by the CLI when a project has several. */
+    name?: string;
     fields?: [name: string, signature: string, sectionCount: number][];
     entries: MigrationStep<S>[];
 }
 
 export interface MigrationBundle<S extends SchemaShape = SchemaShape> {
     readonly kind: "bursztyn.bundle";
+    readonly name?: string;
     readonly hash: bigint;
     readonly version: number;
     readonly manifest: ManifestEntry[];
@@ -37,6 +40,7 @@ export const defineMigrations = <S extends SchemaShape = SchemaShape>(
 
     return {
         kind: "bursztyn.bundle",
+        name: input.name,
         hash: BigInt(input.hash),
         version: migrations.length,
         manifest: (input.fields ?? []).map(([name, signature, sectionCount]) => ({
@@ -54,11 +58,19 @@ export const defineMigrations = <S extends SchemaShape = SchemaShape>(
 export const isBundle = (value: unknown): value is MigrationBundle =>
     typeof value === "object" && value !== null && (value as MigrationBundle).kind === "bursztyn.bundle";
 
+/**
+ * A project with several schemas has several folders, and only the folder that
+ * drifted needs regenerating — so the fix names it.
+ */
+export const generateCommand = (name?: string): string =>
+    name ? `bursztyn generate --only ${name}` : "bursztyn generate";
+
 export class SchemaDriftError extends BursztynError {
     constructor(
         public readonly expected: bigint,
         public readonly actual: bigint,
         public readonly diff: FieldDiff[],
+        public readonly schemaName?: string,
     ) {
         const body =
             diff.length > 0
@@ -66,30 +78,36 @@ export class SchemaDriftError extends BursztynError {
                 : "  (the field list is identical — only the generated hash differs)";
 
         super(
-            `Your schema has changes that are not in a migration:\n\n${body}\n\n` +
-                `  Run:  bursztyn generate\n`,
+            `${schemaName ? `Schema "${schemaName}" has` : "Your schema has"} changes ` +
+                `that are not in a migration:\n\n${body}\n\n` +
+                `  Run:  ${generateCommand(schemaName)}\n`,
         );
     }
 }
 
 export class UnfinishedMigrationError extends BursztynError {
-    constructor(public readonly unfinished: { id: string; pending: string[] }[]) {
+    constructor(
+        public readonly unfinished: { id: string; pending: string[] }[],
+        public readonly schemaName?: string,
+    ) {
         const body = unfinished
             .map((entry) => `  ${entry.id}\n${entry.pending.map((name) => `    - ${name}`).join("\n")}`)
             .join("\n");
 
         super(
-            `Unfinished migrations — these fields are still placeholders:\n\n${body}\n\n` +
+            `Unfinished migrations${schemaName ? ` in "${schemaName}"` : ""} — ` +
+                `these fields are still placeholders:\n\n${body}\n\n` +
                 `  Fill in up(), then delete those names from \`pending\`.\n`,
         );
     }
 }
 
 export class MissingMigrationsError extends BursztynError {
-    constructor() {
+    constructor(public readonly schemaName?: string) {
         super(
-            `This schema is managed by the bursztyn CLI but no migrations have been generated yet.\n\n` +
-                `  Run:  bursztyn generate\n`,
+            `${schemaName ? `Schema "${schemaName}"` : "This schema"} is managed by the bursztyn CLI ` +
+                `but no migrations have been generated yet.\n\n` +
+                `  Run:  ${generateCommand(schemaName)}\n`,
         );
     }
 }

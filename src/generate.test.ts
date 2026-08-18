@@ -205,6 +205,24 @@ describe("planGeneration", () => {
         expect(barrel).toContain("import m0001 from \"./0001_add_stop_bearing\"");
         expect(barrel).toContain("entries: [m0001]");
     });
+
+    it("names the schema in the barrel when a project has several", () => {
+        const barrel = (schemaName?: string) => {
+            const result = planGeneration({
+                compiled: defineSchema({ fields: baseFields }).compiled,
+                journal: emptyJournal(),
+                previous: null,
+                out: "./amber/stops",
+                importFrom: "bursztyn",
+                schemaName,
+                timestamp: TIMESTAMP,
+            });
+            return result.files.find((file) => file.path.endsWith("index.ts"))!.content;
+        };
+
+        expect(barrel("stops")).toContain('name: "stops"');
+        expect(barrel()).not.toContain("name:");
+    });
 });
 
 describe("rename detection", () => {
@@ -331,6 +349,48 @@ describe("managed schema enforcement", () => {
                 migrations: defineMigrations({ hash: "0", entries: [] }),
             }),
         ).toThrow(MissingMigrationsError);
+    });
+
+    it("names the schema and the folder to regenerate when a project has several", () => {
+        const named = (fields: any, entries: any[] = []) => {
+            const compiled = defineSchema({ fields }).compiled;
+            return defineMigrations({
+                name: "stops",
+                hash: compiled.hash.toString(),
+                fields: compiled.layout.map(
+                    (entry) => [entry.name, entry.signature, entry.sectionCount] as [string, string, number],
+                ),
+                entries,
+            });
+        };
+
+        const drift = () =>
+            defineSchema({
+                fields: { ...baseFields, stopBearing: numArray(Uint16Array) },
+                migrations: named(baseFields),
+            });
+        expect(drift).toThrow(SchemaDriftError);
+        expect(drift).toThrow(/Schema "stops" has changes/);
+        expect(drift).toThrow(/bursztyn generate --only stops/);
+
+        const fields = { ...baseFields, stopBearing: numArray(Uint16Array) };
+        const unfinished = () =>
+            defineSchema({
+                fields,
+                migrations: named(fields, [
+                    { id: "0001_add_stop_bearing", defines: ["stopBearing"], pending: ["stopBearing"] },
+                ]),
+            });
+        expect(unfinished).toThrow(UnfinishedMigrationError);
+        expect(unfinished).toThrow(/Unfinished migrations in "stops"/);
+
+        const missing = () =>
+            defineSchema({
+                fields: baseFields,
+                migrations: defineMigrations({ name: "stops", hash: "0", entries: [] }),
+            });
+        expect(missing).toThrow(MissingMigrationsError);
+        expect(missing).toThrow(/bursztyn generate --only stops/);
     });
 
     it("derives version from the bundle and rejects a manual one", () => {

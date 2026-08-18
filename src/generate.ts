@@ -263,6 +263,7 @@ const renderBarrel = (
     journal: Journal,
     snapshot: SchemaSnapshot,
     importFrom: string,
+    schemaName?: string,
 ): string => {
     const steps = journal.entries.filter((entry) => entry.version > 0);
     const imports = steps
@@ -278,6 +279,7 @@ const renderBarrel = (
         `import { defineMigrations } from "${importFrom}";\n` +
         (imports ? `${imports}\n` : "") +
         `\nexport default defineMigrations({\n` +
+        (schemaName ? `    name: "${schemaName}",\n` : "") +
         `    hash: "${snapshot.hash}",\n` +
         `    fields: [\n${fields}\n    ],\n` +
         `    entries: [${steps.map((entry) => `m${migrationNumber(entry.version)}`).join(", ")}],\n` +
@@ -291,7 +293,13 @@ export interface GenerateOptions {
     previous: SchemaSnapshot | null;
     out: string;
     importFrom: string;
+    /** Migration name, appended to the version number in the filename. */
     name?: string;
+    /**
+     * Which schema this folder tracks. Written into the bundle so runtime
+     * refusals can name it; left out when the project has only one.
+     */
+    schemaName?: string;
     renames?: Record<string, string>;
     timestamp: string;
 }
@@ -310,7 +318,7 @@ export interface GenerateResult {
 }
 
 export const planGeneration = (options: GenerateOptions): GenerateResult => {
-    const { compiled, journal, previous, out, importFrom, timestamp } = options;
+    const { compiled, journal, previous, out, importFrom, schemaName, timestamp } = options;
     const fields = compiled.layout.map(
         (entry) => [entry.name, entry.signature, entry.sectionCount] as [string, string, number],
     );
@@ -334,7 +342,10 @@ export const planGeneration = (options: GenerateOptions): GenerateResult => {
             files: [
                 { path: snapshotPath(out, 0), content: `${JSON.stringify(snapshot, null, 2)}\n` },
                 { path: journalPath(out), content: `${JSON.stringify(nextJournal, null, 2)}\n` },
-                { path: barrelPath(out), content: renderBarrel(nextJournal, snapshot, importFrom) },
+                {
+                    path: barrelPath(out),
+                    content: renderBarrel(nextJournal, snapshot, importFrom, schemaName),
+                },
             ],
         };
     }
@@ -366,7 +377,10 @@ export const planGeneration = (options: GenerateOptions): GenerateResult => {
             },
             { path: snapshotPath(out, version), content: `${JSON.stringify(snapshot, null, 2)}\n` },
             { path: journalPath(out), content: `${JSON.stringify(nextJournal, null, 2)}\n` },
-            { path: barrelPath(out), content: renderBarrel(nextJournal, snapshot, importFrom) },
+            {
+                path: barrelPath(out),
+                content: renderBarrel(nextJournal, snapshot, importFrom, schemaName),
+            },
         ],
     };
 };

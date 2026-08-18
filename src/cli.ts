@@ -2,9 +2,16 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { enforcement } from "./bundle.ts";
+import {
+    ConfigError,
+    DEFAULT_OUT,
+    resolveTargets,
+    type ConfigFile,
+    type Target,
+} from "./config.ts";
 import { diffManifest, inspect, isSnapshot } from "./format.ts";
 import { planGeneration, renameCandidates, type SchemaChange } from "./generate.ts";
 import {
@@ -27,7 +34,13 @@ const red = (text: string) => paint("31", text);
 const green = (text: string) => paint("32", text);
 const yellow = (text: string) => paint("33", text);
 
-const write = (text: string) => process.stdout.write(`${text}\n`);
+/**
+ * Indented while a run is working through one schema of several, so a target's
+ * whole block sits under its heading without every call knowing about it.
+ */
+let indent = "";
+
+const write = (text: string) => process.stdout.write(text.length === 0 ? "\n" : `${indent}${text}\n`);
 const warn = (text: string) => process.stderr.write(`${yellow("!")} ${text}\n`);
 const fail = (text: string): never => {
     process.stderr.write(`${red("✗")} ${text}\n`);
@@ -36,14 +49,16 @@ const fail = (text: string): never => {
 
 const USAGE = `${bold("bursztyn")} — schema snapshots with generated migrations
 
-  bursztyn generate [--name <name>] [--rename <old>=<new>] [--split]
-  bursztyn status
+  bursztyn generate [--only <name>] [--name <name>] [--rename <old>=<new>]
+  bursztyn status [--only <name>]
   bursztyn inspect <file.brsz> [--json] [--sort=bytes|name|order] [--top=N]
 
 Options:
-  --schema <path>   schema module (default: bursztyn.config.json → "schema")
-  --out <dir>       migrations folder (default: ./amber)
+  --only <name>     act on one schema, by name (repeatable; default: all of them)
   --config <path>   config file (default: ./bursztyn.config.json)
+  --schema <path>   a schema module, used instead of the configured list
+  --export <name>   which export to take, when a module holds several schemas
+  --out <dir>       migrations folder (default: ${DEFAULT_OUT})
 `;
 
 const args = process.argv.slice(2);
@@ -64,77 +79,88 @@ const flags = (name: string): string[] =>
         )
         .filter((value): value is string => value !== undefined);
 
-// Deliberately not "./bursztyn": a folder named after the package shadows the
-// package for bare-specifier resolution.
-const DEFAULT_OUT = "./amber";
-
 const REEXEC_FLAG = "BURSZTYN_REEXEC";
 
-interface Config {
-    schema: string;
-    out: string;
-    importFrom: string;
-}
-
-const loadConfig = async (): Promise<Config> => {
+const loadConfigFile = async (): Promise<ConfigFile> => {
     const path = resolve(flag("config") ?? "bursztyn.config.json");
-    let file: Partial<Config> = {};
 
     try {
-        file = JSON.parse(await readFile(path, "utf8")) as Partial<Config>;
+        return JSON.parse(await readFile(path, "utf8")) as ConfigFile;
     } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+        if (error instanceof SyntaxError) fail(`${path} is not valid JSON.\n\n  ${error.message}`);
+        throw error;
     }
-
-    const schema = flag("schema") ?? file.schema;
-    if (!schema) {
-        fail(
-            `No schema module configured.\n\n  Create ${bold("bursztyn.config.json")}:\n\n` +
-                `    { "schema": "./src/schema.ts", "out": "./amber" }\n\n` +
-                `  …or pass ${bold("--schema <path>")}.`,
-        );
-    }
-
-    return {
-        schema: schema!,
-        out: flag("out") ?? file.out ?? DEFAULT_OUT,
-        importFrom: file.importFrom ?? "bursztyn",
-    };
 };
+
+/** The schemas this invocation works on, in config order. */
+const loadTargets = async (): Promise<Target[]> => {
+    const file = await loadConfigFile();
+
+    try {
+        return resolveTargets(file, {
+            schema: flag("schema"),
+            out: flag("out"),
+            export: flag("export"),
+            only: flags("only"),
+        });
+    } catch (error) {
+        if (error instanceof ConfigError) return fail(error.message);
+        throw error;
+    }
+};
+
+/** What to tell someone to run when this particular schema needs regenerating. */
+const fixCommand = (target: Target): string =>
+    target.multiSchema ? `bursztyn generate --only ${target.name}` : "bursztyn generate";
 
 /**
  * A folder named after the package shadows it for bare specifiers: the schema's
  * own `from "bursztyn"` can land on the migrations folder, and `bun bursztyn
  * generate` runs the generated bundle instead of this CLI — printing nothing
- * and exiting 0, which reads as the command having done nothing.
+ * and exiting 0, which reads as the command having done nothing. Any segment of
+ * the path does it, so `./bursztyn/stops` is caught too.
  *
  * Emitted before the schema is loaded, because the usual symptom is that the
  * schema fails to load. A process we handed over to stays quiet so the warning
  * is not printed twice.
  */
+let shadowWarned = false;
+
 const warnIfOutShadowsPackage = (out: string) => {
-    if (basename(resolve(out)) !== "bursztyn" || process.env[REEXEC_FLAG] === "1") return;
+    if (shadowWarned || process.env[REEXEC_FLAG] === "1") return;
+
+    const parts = relative(process.cwd(), resolve(out)).split(sep);
+    const index = parts.indexOf("bursztyn");
+    if (index === -1) return;
+
+    // The offending folder, not the whole path: with several schemas the
+    // shadowing one is the shared root they all sit under.
+    const joined = parts.slice(0, index + 1).join("/");
+    const folder = joined.startsWith(".") ? joined : `./${joined}`;
+    shadowWarned = true;
 
     warn(
-        `${bold(out)} has the same name as the package, so ${bold("bun bursztyn …")} runs the\n` +
+        `${bold(folder)} has the same name as the package, so ${bold("bun bursztyn …")} runs the\n` +
             `  generated bundle instead of this CLI, and a schema importing ${bold('"bursztyn"')} can\n` +
             `  resolve to it. Rename ${bold("out")} — ${bold(DEFAULT_OUT)} is the default.\n`,
     );
 };
 
-const ensureBundleStub = async (out: string, importFrom: string) => {
-    const path = resolve(out, "index.ts");
+const ensureBundleStub = async (target: Target) => {
+    const path = resolve(target.out, "index.ts");
     if (await readFile(path, "utf8").then(() => true).catch(() => false)) return;
+
+    const name = target.multiSchema ? `    name: "${target.name}",\n` : "";
 
     await mkdir(dirname(path), { recursive: true });
     await writeFile(
         path,
         `// Generated by bursztyn — do not edit.\n` +
-            `import { defineMigrations } from "${importFrom}";\n\n` +
-            `export default defineMigrations({\n    hash: "0",\n    entries: [],\n});\n`,
+            `import { defineMigrations } from "${target.importFrom}";\n\n` +
+            `export default defineMigrations({\n${name}    hash: "0",\n    entries: [],\n});\n`,
     );
 };
-
 
 /** Bun as PATH holds it — `bun.exe`, or a `bun.cmd` shim if it came from npm. */
 const findBun = (): string | null => {
@@ -188,9 +214,7 @@ const rerunUnderBun = (path: string, cause: unknown): never => {
     );
 };
 
-const loadSchema = async (path: string): Promise<Schema<any>> => {
-    enforcement.enabled = false;
-
+const schemaExports = async (path: string): Promise<[name: string, schema: Schema<any>][]> => {
     const absolute = isAbsolute(path) ? path : resolve(path);
     const nodeCannotLoadIt = absolute.endsWith(".ts") && !("Bun" in globalThis) && !("Deno" in globalThis);
     let module: Record<string, unknown>;
@@ -204,13 +228,73 @@ const loadSchema = async (path: string): Promise<Schema<any>> => {
         return fail(`Could not import ${path}\n\n  ${String(error)}`);
     }
 
-    for (const value of Object.values(module)) {
-        if (value instanceof Schema) return value;
+    return Object.entries(module).filter(
+        (entry): entry is [string, Schema<any>] => entry[1] instanceof Schema,
+    );
+};
+
+/**
+ * One target, one schema. A module holding several is not guessed at — picking
+ * the wrong one would generate a migration for a schema nobody asked about and
+ * leave the other silently untracked.
+ */
+const loadSchema = async (target: Target): Promise<Schema<any>> => {
+    const found = await schemaExports(target.schema);
+    const names = found.map(([name]) => name);
+
+    if (target.export !== undefined) {
+        const match = found.find(([name]) => name === target.export);
+        if (match) return match[1];
+
+        return fail(
+            `${target.schema} has no schema exported as ${bold(target.export)}.\n\n` +
+                (found.length > 0
+                    ? `  It exports: ${names.join(", ")}`
+                    : `  It exports no schema at all.`),
+        );
     }
 
+    if (found.length === 1) return found[0][1];
+
+    if (found.length === 0) {
+        return fail(
+            `${target.schema} does not export a schema.\n\n  Expected something built with ${bold("defineSchema()")}.`,
+        );
+    }
+
+    const entries = names
+        .map((name) => `        { "schema": "${target.schema}", "export": "${name}" }`)
+        .join(",\n");
+
     return fail(
-        `${path} does not export a schema.\n\n  Expected something built with ${bold("defineSchema()")}.`,
+        `${target.schema} exports ${found.length} schemas: ${names.join(", ")}.\n\n` +
+            `  Each one needs its own migrations folder, so say which is which:\n\n` +
+            `    { "schemas": [\n${entries}\n    ] }\n\n` +
+            `  …or pass ${bold("--export <name>")}.`,
     );
+};
+
+interface Loaded {
+    target: Target;
+    schema: Schema<any>;
+}
+
+/**
+ * Stubs first, then every schema, then any work — so a run that has to hand
+ * itself to Bun, or that names an export that does not exist, does it before
+ * the first target has written anything.
+ */
+const load = async (targets: Target[]): Promise<Loaded[]> => {
+    enforcement.enabled = false;
+
+    for (const target of targets) {
+        warnIfOutShadowsPackage(target.out);
+        await ensureBundleStub(target);
+    }
+
+    const loaded: Loaded[] = [];
+    for (const target of targets) loaded.push({ target, schema: await loadSchema(target) });
+    return loaded;
 };
 
 const readJournal = async (out: string): Promise<Journal> => {
@@ -235,7 +319,7 @@ const ask = async (question: string): Promise<boolean> => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
     try {
-        const answer = await rl.question(`${question} ${dim("[y/N]")} `);
+        const answer = await rl.question(`${indent}${question} ${dim("[y/N]")} `);
         return answer.trim().toLowerCase().startsWith("y");
     } finally {
         rl.close();
@@ -256,20 +340,19 @@ const describeChangeLines = (change: SchemaChange): string[] => {
     return lines;
 };
 
-const runGenerate = async () => {
-    const config = await loadConfig();
-    warnIfOutShadowsPackage(config.out);
-    await ensureBundleStub(config.out, config.importFrom);
-    const schema = await loadSchema(config.schema);
-    const journal = await readJournal(config.out);
-    const previous = await lastSnapshot(config.out, journal);
+/** Printed above a target's block, but only when the run covers several. */
+const heading = (target: Target, first: boolean) => {
+    if (!first) process.stdout.write("\n");
+    process.stdout.write(`${bold(target.name)}  ${dim(target.schema)}\n`);
+};
 
-    const renames: Record<string, string> = {};
-    for (const pair of flags("rename")) {
-        const [from, to] = pair.split("=");
-        if (!from || !to) fail(`--rename expects old=new, got "${pair}"`);
-        renames[from] = to;
-    }
+const generateOne = async (
+    { target, schema }: Loaded,
+    given: { name?: string; renames: Record<string, string> },
+): Promise<number> => {
+    const journal = await readJournal(target.out);
+    const previous = await lastSnapshot(target.out, journal);
+    const renames = { ...given.renames };
 
     if (previous) {
         const diff = diffManifest(snapshotManifest(previous), schema.compiled.layout);
@@ -284,9 +367,10 @@ const runGenerate = async () => {
 
             if (!tty) {
                 fail(
-                    `Ambiguous change: ${candidate.removed} disappeared and ${candidate.added} appeared, ` +
+                    `Ambiguous change${target.multiSchema ? ` in "${target.name}"` : ""}: ` +
+                        `${candidate.removed} disappeared and ${candidate.added} appeared, ` +
                         `both ${candidate.signature}.\n\n` +
-                        `  If it is a rename:  bursztyn generate --rename ${candidate.removed}=${candidate.added}\n` +
+                        `  If it is a rename:  ${fixCommand(target)} --rename ${candidate.removed}=${candidate.added}\n` +
                         `  If it is not, run this in a terminal and answer the prompt.`,
                 );
             }
@@ -299,16 +383,17 @@ const runGenerate = async () => {
         compiled: schema.compiled,
         journal,
         previous,
-        out: config.out,
-        importFrom: config.importFrom,
-        name: flag("name"),
+        out: target.out,
+        importFrom: target.importFrom,
+        schemaName: target.multiSchema ? target.name : undefined,
+        name: given.name,
         renames,
         timestamp: new Date().toISOString(),
     });
 
     if (result.status === "up-to-date") {
         write(`${green("✓")} Schema is up to date ${dim(`(version ${previous!.version})`)}`);
-        return;
+        return 0;
     }
 
     for (const file of result.files) {
@@ -317,13 +402,13 @@ const runGenerate = async () => {
     }
 
     if (result.status === "initial") {
-        write(`${green("✓")} Initialised ${bold(config.out)} at version 0`);
+        write(`${green("✓")} Initialised ${bold(target.out)} at version 0`);
         write(dim(`  ${schema.compiled.layout.length} fields recorded in meta/0000_snapshot.json`));
         write("");
         write(`  Import the generated bundle in your schema module:`);
-        write(dim(`    import migrations from "${config.out}";`));
+        write(dim(`    import migrations from "${target.out}";`));
         write(dim(`    export const schema = defineSchema({ fields, migrations });`));
-        return;
+        return 0;
     }
 
     write(`${green("✓")} ${bold(result.id!)}`);
@@ -334,35 +419,86 @@ const runGenerate = async () => {
     const pending = result.change!.added.length + result.change!.changed.length;
     if (pending === 0) {
         write(`  ${green("Nothing to fill in")} — every field is carried over untouched.`);
-        return;
+        return 0;
     }
 
-    const file = result.files[0].path;
     write(
         `  ${yellow(`⚠ ${pending} field${pending === 1 ? "" : "s"} need${pending === 1 ? "s" : ""} data.`)}`,
     );
-    write(`  Open ${bold(file)}, fill in ${bold("up()")}, then delete the names from ${bold("pending")}.`);
+    write(
+        `  Open ${bold(result.files[0].path)}, fill in ${bold("up()")}, then delete the names from ${bold("pending")}.`,
+    );
     write("");
     write(`  ${dim("Until then the app refuses to start.")}`);
-    process.exitCode = 1;
+    return pending;
 };
 
-const runStatus = async () => {
-    const config = await loadConfig();
-    warnIfOutShadowsPackage(config.out);
-    await ensureBundleStub(config.out, config.importFrom);
-    const schema = await loadSchema(config.schema);
-    const journal = await readJournal(config.out);
-    const previous = await lastSnapshot(config.out, journal);
+const runGenerate = async () => {
+    const targets = await loadTargets();
+    const many = targets.length > 1;
+    const name = flag("name");
+    const renamePairs = flags("rename");
 
-    if (!previous) {
-        write(`${yellow("!")} ${bold(config.out)} is empty — run ${bold("bursztyn generate")}`);
-        process.exitCode = 1;
-        return;
+    // Both describe one specific change to one specific schema; applying either
+    // to a whole project would mislabel whatever else happened to be dirty.
+    if (many && (name !== undefined || renamePairs.length > 0)) {
+        fail(
+            `${bold("--name")} and ${bold("--rename")} apply to one schema, ` +
+                `but ${targets.length} are selected.\n\n` +
+                `  Add ${bold("--only <name>")} — this project has: ${targets.map((target) => target.name).join(", ")}`,
+        );
     }
 
-    const drifted = BigInt(previous.hash) !== schema.compiled.hash;
-    if (drifted) {
+    const renames: Record<string, string> = {};
+    for (const pair of renamePairs) {
+        const [from, to] = pair.split("=");
+        if (!from || !to) fail(`--rename expects old=new, got "${pair}"`);
+        renames[from] = to;
+    }
+
+    const loaded = await load(targets);
+    let unfinishedFields = 0;
+    let unfinishedSchemas = 0;
+
+    for (const [index, entry] of loaded.entries()) {
+        if (many) heading(entry.target, index === 0);
+        indent = many ? "  " : "";
+
+        const pending = await generateOne(entry, { name, renames });
+        if (pending > 0) {
+            unfinishedFields += pending;
+            unfinishedSchemas++;
+        }
+    }
+
+    indent = "";
+
+    if (unfinishedSchemas === 0) return;
+
+    process.exitCode = 1;
+    if (!many) return;
+
+    write("");
+    write(
+        yellow(
+            `⚠ ${unfinishedFields} field${unfinishedFields === 1 ? "" : "s"} across ` +
+                `${unfinishedSchemas} schema${unfinishedSchemas === 1 ? "" : "s"} still need` +
+                `${unfinishedFields === 1 ? "s" : ""} data.`,
+        ),
+    );
+};
+
+/** True when this schema is generated, finished, and matches its folder. */
+const statusOne = async ({ target, schema }: Loaded): Promise<boolean> => {
+    const journal = await readJournal(target.out);
+    const previous = await lastSnapshot(target.out, journal);
+
+    if (!previous) {
+        write(`${yellow("!")} ${bold(target.out)} is empty — run ${bold(fixCommand(target))}`);
+        return false;
+    }
+
+    if (BigInt(previous.hash) !== schema.compiled.hash) {
         write(`${red("✗")} Schema has uncommitted changes ${dim(`(version ${previous.version})`)}`);
         write("");
         const diff = diffManifest(snapshotManifest(previous), schema.compiled.layout);
@@ -374,12 +510,11 @@ const runStatus = async () => {
             }
         }
         write("");
-        write(`  Run:  ${bold("bursztyn generate")}`);
-        process.exitCode = 1;
-        return;
+        write(`  Run:  ${bold(fixCommand(target))}`);
+        return false;
     }
 
-    const bundle = await import(pathToFileURL(resolve(config.out, "index.ts")).href)
+    const bundle = await import(pathToFileURL(resolve(target.out, "index.ts")).href)
         .then((module) => module.default)
         .catch(() => null);
 
@@ -388,15 +523,41 @@ const runStatus = async () => {
         write("");
         for (const entry of bundle.unfinished) {
             write(`  ${bold(entry.id)}`);
-            for (const name of entry.pending) write(`    ${yellow("-")} ${name}`);
+            for (const field of entry.pending) write(`    ${yellow("-")} ${field}`);
         }
         write("");
         write(`  Fill in ${bold("up()")}, then delete those names from ${bold("pending")}.`);
-        process.exitCode = 1;
-        return;
+        return false;
     }
 
     write(`${green("✓")} Up to date ${dim(`— version ${previous.version}, ${previous.fields.length} fields`)}`);
+    return true;
+};
+
+const runStatus = async () => {
+    const targets = await loadTargets();
+    const many = targets.length > 1;
+    const loaded = await load(targets);
+    let failing = 0;
+
+    for (const [index, entry] of loaded.entries()) {
+        if (many) heading(entry.target, index === 0);
+        indent = many ? "  " : "";
+
+        if (!(await statusOne(entry))) failing++;
+    }
+
+    indent = "";
+
+    if (failing > 0) process.exitCode = 1;
+    if (!many) return;
+
+    write("");
+    write(
+        failing === 0
+            ? `${green("✓")} ${loaded.length} schemas up to date`
+            : `${red("✗")} ${failing} of ${loaded.length} schemas need attention`,
+    );
 };
 
 const formatBytes = (bytes: number): string => {

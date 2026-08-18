@@ -228,6 +228,63 @@ amber/
 `index.ts` carries the current hash and field manifest, which is how your app detects drift without
 reading any of it.
 
+### Several schemas
+
+A timetable and a geocoding index do not share a shape, a release cadence, or a reason to change
+together. List them, and each gets a folder of its own:
+
+```json
+// bursztyn.config.json
+{ "schemas": ["./src/stops.ts", "./src/routes.ts"], "out": "./amber" }
+```
+
+```
+amber/
+  stops/     index.ts  0001_add_stop_bearing.ts  meta/…
+  routes/    index.ts  meta/…
+```
+
+Nothing is shared. Each schema has its own journal, so its version numbers are its own — adding a
+field to `stops` leaves `routes` at the version it was, and neither can renumber the other. The name
+comes from the filename, falling back to the folder when the file is called `schema.ts`
+(`src/routes/schema.ts` → `routes`), and `{ "schema": "…", "name": "…" }` overrides it.
+
+`generate` and `status` walk every schema, report one block each, and exit non-zero if any of them
+needs attention:
+
+```
+$ bursztyn status
+stops  ./src/stops.ts
+  ✗ Schema has uncommitted changes (version 2)
+
+    + stopBearing num:Uint16Array
+
+    Run:  bursztyn generate --only stops
+
+routes  ./src/routes.ts
+  ✓ Up to date — version 1, 4 fields
+
+✗ 1 of 2 schemas need attention
+```
+
+`--only <name>` narrows a run to one schema, and is *required* by `--name` and `--rename`, which
+describe one specific change to one specific schema. The import-time refusals name the schema too —
+a drifted `stops` says `bursztyn generate --only stops`, so the error stays a command you can paste
+even with six folders in play.
+
+Two schemas in one module are fine, but the CLI will not pick between them: it prints both export
+names and the config that tells them apart.
+
+```json
+{ "schemas": [
+    { "schema": "./src/schemas.ts", "export": "stops" },
+    { "schema": "./src/schemas.ts", "export": "routes" }
+] }
+```
+
+The single-schema form still means exactly what it did — one flat folder, and messages that do not
+bother naming the only schema there is.
+
 ### The three refusals
 
 `defineSchema` throws at import time, before a single byte is read, when:
@@ -393,8 +450,8 @@ schema hash is stable across versions of this library but is not a checksum of y
 ## API
 
 ```
-bursztyn generate [--name x] [--rename old=new] [--schema p] [--out d]
-bursztyn status                                  // exits non-zero on drift or placeholders
+bursztyn generate [--only x] [--name x] [--rename old=new] [--schema p] [--export x] [--out d]
+bursztyn status [--only x]                       // exits non-zero on drift or placeholders
 bursztyn inspect <file.brsz> [--json] [--sort=bytes|name|order] [--top=N]
 ```
 

@@ -3,6 +3,7 @@ export type { OpenOptions, OpenResult, SchemaDefinition } from "./schema.ts";
 
 export {
     defineMigrations,
+    generateCommand,
     isBundle,
     todo,
     MissingMigrationsError,
@@ -11,6 +12,18 @@ export {
     type MigrationBundle,
     type MigrationBundleInput,
 } from "./bundle.ts";
+
+export {
+    ConfigError,
+    DEFAULT_IMPORT_FROM,
+    DEFAULT_OUT,
+    deriveName,
+    resolveTargets,
+    type ConfigFile,
+    type Overrides,
+    type Target,
+    type TargetInput,
+} from "./config.ts";
 
 export {
     describeChange,

@@ -88,13 +88,15 @@ export const fieldFromSignature = (signature: string): Field<any, any> => {
             return keyedIndex(columnFromTag(rest, signature));
         case "multiBucketArray":
             return multiBucketArray(columnsFromTags(rest, signature));
-        case "pairIndex2":
+        case "pairIndex3":
             return pairIndex(columnsFromTags(rest, signature));
-        // Snapshots written before the pair key was mixed. Only ever reached
+        // Snapshots written under an earlier key placement. Only ever reached
         // through a manifest, never through a schema, so an old file still
         // opens and still migrates.
+        case "pairIndex2":
+            return pairIndexLegacy(columnsFromTags(rest, signature), 2);
         case "pairIndex":
-            return pairIndexLegacy(columnsFromTags(rest, signature));
+            return pairIndexLegacy(columnsFromTags(rest, signature), 1);
         default:
             throw new UnknownSignatureError(signature);
     }

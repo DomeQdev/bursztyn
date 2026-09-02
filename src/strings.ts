@@ -314,26 +314,110 @@ export class StringReader {
      * allocate. UTF-8 is never shorter than one byte per UTF-16 code unit, and
      * is strictly longer for every non-ASCII one — so an equal length proves
      * both sides are ASCII and the bytes compare directly against code units.
+     * Anything longer is decoded in place, one code point at a time, against
+     * the key's code units: a non-ASCII key used to fall back to `get()` and
+     * pay a string allocation on every hit.
      */
     equals(id: number, key: string): boolean {
         if (id <= 0 || id >= this.n) return key.length === 0;
 
         const start = this.offsets[id];
-        const byteLength = this.offsets[id + 1] - start;
+        const end = this.offsets[id + 1];
+        const byteLength = end - start;
         if (byteLength < key.length) return false;
 
+        const bytes = this.bytes;
         if (byteLength === key.length) {
-            const bytes = this.bytes;
-            for (let i = 0; i < byteLength; i++) {
+            let i = 0;
+            for (; i < byteLength; i++) {
                 const c = key.charCodeAt(i);
-                if (c > 0x7f || bytes[start + i] !== c) return false;
+                // A non-ASCII code unit under an equal byte count cannot match
+                // well-formed UTF-8; only a corrupt table could, and the slow
+                // path knows how to tell.
+                if (c > 0x7f) break;
+                if (bytes[start + i] !== c) return false;
             }
-            return true;
+            if (i === byteLength) return true;
         }
 
-        return this.get(id) === key;
+        const verdict = equalsUtf8(bytes, start, end, key);
+        return verdict === undefined ? this.get(id) === key : verdict;
     }
 }
+
+/**
+ * Does `bytes[start..end)`, read as UTF-8, spell exactly `key`? `undefined`
+ * when the bytes are not well-formed UTF-8, so the caller can let the decoder
+ * decide what such a sequence turns into.
+ *
+ * The table is always TextEncoder output, so this never sees a malformed
+ * sequence in practice — an unpaired surrogate in the original was stored as
+ * U+FFFD, which is also what `get()` hands back, so comparing the decoded code
+ * points against the key's code units is the same test `get(id) === key` is.
+ * The well-formedness checks exist so a corrupt section still gets exactly the
+ * decoder's answer rather than a guess.
+ */
+const equalsUtf8 = (bytes: Uint8Array, start: number, end: number, key: string): boolean | undefined => {
+    const length = key.length;
+    let i = start;
+    let k = 0;
+
+    while (i < end && k < length) {
+        const b0 = bytes[i];
+
+        if (b0 < 0x80) {
+            if (key.charCodeAt(k) !== b0) return false;
+            i += 1;
+            k += 1;
+            continue;
+        }
+
+        // A continuation byte in lead position, or an overlong two-byte form.
+        if (b0 < 0xc2) return undefined;
+
+        if (b0 < 0xe0) {
+            if (i + 1 >= end) return undefined;
+            const b1 = bytes[i + 1];
+            if ((b1 & 0xc0) !== 0x80) return undefined;
+            if (key.charCodeAt(k) !== (((b0 & 0x1f) << 6) | (b1 & 0x3f))) return false;
+            i += 2;
+            k += 1;
+            continue;
+        }
+
+        if (b0 < 0xf0) {
+            if (i + 2 >= end) return undefined;
+            const b1 = bytes[i + 1];
+            const b2 = bytes[i + 2];
+            if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80) return undefined;
+            const c = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
+            // Overlong, or an encoded surrogate — neither is UTF-8.
+            if (c < 0x800 || (c >= 0xd800 && c <= 0xdfff)) return undefined;
+            if (key.charCodeAt(k) !== c) return false;
+            i += 3;
+            k += 1;
+            continue;
+        }
+
+        if (b0 >= 0xf5 || i + 3 >= end) return undefined;
+        const b1 = bytes[i + 1];
+        const b2 = bytes[i + 2];
+        const b3 = bytes[i + 3];
+        if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80 || (b3 & 0xc0) !== 0x80) return undefined;
+        const point = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
+        if (point < 0x10000 || point > 0x10ffff) return undefined;
+
+        // A valid four-byte sequence is a surrogate pair on the string side.
+        if (k + 1 >= length) return false;
+        const offset = point - 0x10000;
+        if (key.charCodeAt(k) !== (0xd800 | (offset >> 10))) return false;
+        if (key.charCodeAt(k + 1) !== (0xdc00 | (offset & 0x3ff))) return false;
+        i += 4;
+        k += 2;
+    }
+
+    return i === end && k === length;
+};
 
 export const STRING_TABLE_SIGNATURE = "stringTable";
 

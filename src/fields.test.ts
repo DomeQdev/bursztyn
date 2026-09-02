@@ -13,6 +13,8 @@ import {
     SortedU32IndexReader,
     TrigramIndexBuilder,
     TrigramIndexReader,
+    fieldFromSignature,
+    pairIndex,
     stringRef,
     u32,
 } from "./index.ts";
@@ -74,6 +76,77 @@ describe("StringInterner", () => {
         }
         expect(hydrated.size).toBe(original.size);
         expect(hydrated.add("Kraków")).toBe(ids[0]);
+    });
+});
+
+describe("StringReader.equals", () => {
+    const interner = new StringInterner();
+    const ascii = interner.add("Rondo ONZ");
+    const latin = interner.add("Kraków");
+    const polish = interner.add("Świętokrzyska");
+    const emoji = interner.add("🚋 tram");
+    const lone = interner.add("a\uD800b");
+    const reader = makeStringReader(interner);
+
+    it("matches ASCII without decoding", () => {
+        expect(reader.equals(ascii, "Rondo ONZ")).toBe(true);
+        expect(reader.equals(ascii, "Rondo ONy")).toBe(false);
+        expect(reader.equals(ascii, "Rondo ON")).toBe(false);
+        expect(reader.equals(ascii, "Rondo ONZ ")).toBe(false);
+    });
+
+    it("matches multi-byte strings against the key's code units", () => {
+        expect(reader.equals(latin, "Kraków")).toBe(true);
+        expect(reader.equals(latin, "Krakow")).toBe(false);
+        expect(reader.equals(latin, "Krakó")).toBe(false);
+        expect(reader.equals(latin, "Kraków ")).toBe(false);
+        expect(reader.equals(polish, "Świętokrzyska")).toBe(true);
+        expect(reader.equals(polish, "Swiętokrzyska")).toBe(false);
+        expect(reader.equals(polish, "Świętokrzysk")).toBe(false);
+    });
+
+    it("matches surrogate pairs and never a key that is shorter than the bytes allow", () => {
+        expect(reader.equals(emoji, "🚋 tram")).toBe(true);
+        expect(reader.equals(emoji, "🚋 trak")).toBe(false);
+        expect(reader.equals(emoji, "🚌 tram")).toBe(false);
+        expect(reader.equals(emoji, "🚋 tra")).toBe(false);
+        expect(reader.equals(emoji, "\uD83D tram")).toBe(false);
+    });
+
+    it("agrees with get() on what an unpaired surrogate became", () => {
+        expect(reader.get(lone)).toBe("a�b");
+        expect(reader.equals(lone, "a�b")).toBe(true);
+        expect(reader.equals(lone, "a\uD800b")).toBe(false);
+    });
+
+    it("keeps the empty-string and out-of-range rules", () => {
+        expect(reader.equals(0, "")).toBe(true);
+        expect(reader.equals(0, "x")).toBe(false);
+        expect(reader.equals(99, "")).toBe(true);
+        expect(reader.equals(99, "x")).toBe(false);
+    });
+
+    it("gives the decoder's answer for bytes that are not UTF-8", () => {
+        // A lone continuation byte, an encoded surrogate, a truncated sequence
+        // and a stray 0xFF — each is what a corrupt section could hold, and
+        // each decodes to something `equals` must agree with exactly.
+        const chunks = [[0x80], [0xed, 0xa0, 0x80], [0xe2, 0x82], [0x61, 0xff, 0x62], [0xc3, 0x41]];
+        const offsets = new Uint32Array(chunks.length + 2);
+        const bytes: number[] = [];
+        chunks.forEach((chunk, i) => {
+            bytes.push(...chunk);
+            offsets[i + 2] = bytes.length;
+        });
+        const corrupt = new StringReader(offsets, new Uint8Array(bytes));
+
+        for (let id = 1; id <= chunks.length; id++) {
+            const decoded = corrupt.get(id);
+            expect(decoded).toContain("�");
+            expect(corrupt.equals(id, decoded)).toBe(true);
+            expect(corrupt.equals(id, decoded + " ")).toBe(false);
+            expect(corrupt.equals(id, "\uD800")).toBe(false);
+            expect(corrupt.equals(id, "a")).toBe(false);
+        }
     });
 });
 
@@ -219,6 +292,78 @@ describe("TrigramIndexReader", () => {
         ]);
         expect(reader.search("Aleja Jana", { limit: 1 }).length).toBe(1);
     });
+
+    // The reference: score every name by how many of the query's trigram
+    // positions it contains, apply the same cutoff, sort by score. The reader
+    // must agree on membership and scores, rank monotonically, and hand out a
+    // limited result that is a prefix of the unlimited one.
+    const trigramsOf = (s: string): string[] => {
+        const lower = s.toLowerCase();
+        if (lower.length === 0) return [];
+        if (lower.length < 3) return [lower];
+        const out: string[] = [];
+        for (let i = 0; i + 3 <= lower.length; i++) out.push(lower.slice(i, i + 3));
+        return out;
+    };
+    const reference = (names: string[], query: string, ratio = 0.7) => {
+        const qt = trigramsOf(query);
+        const scored = names.map((name, idx) => {
+            const own = new Set(trigramsOf(name));
+            let score = 0;
+            for (const t of qt) if (own.has(t)) score++;
+            return { idx, score };
+        });
+        const max = Math.max(0, ...scored.map((s) => s.score));
+        const cutoff = Math.max(Math.max(1, qt.length - 1), max * ratio);
+        return scored.filter((s) => s.score >= cutoff).sort((a, b) => b.score - a.score);
+    };
+
+    it("agrees with a naive scorer on membership, scores and ranking", () => {
+        const syllables = ["war", "sza", "wa", "kra", "kow", "ron", "do", "onz", "plac", "ul", "ana", "ban"];
+        const names: string[] = [];
+        let seed = 7;
+        for (let i = 0; i < 400; i++) {
+            let name = "";
+            const parts = 1 + (i % 4);
+            for (let k = 0; k < parts; k++) {
+                seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+                name += syllables[seed % syllables.length] + (k % 2 === 0 ? "" : " ");
+            }
+            names.push(name.trim() + (i % 3 === 0 ? ` ${i}` : ""));
+        }
+        const reader = build(names.map((name, idx) => [idx, name]));
+
+        for (const query of ["war", "banana", "kra ków", "plac onz", "wa", "ul ana", "aaaa", "ronda"]) {
+            const expected = reference(names, query);
+            const actual = reader.search(query);
+
+            expect(actual.length).toBe(expected.length);
+            const expectedScores = new Map(expected.map((e) => [e.idx, e.score]));
+            for (const { idx, score } of actual) expect(score).toBe(expectedScores.get(idx)!);
+            for (let i = 1; i < actual.length; i++) {
+                expect(actual[i].score).toBeLessThanOrEqual(actual[i - 1].score);
+            }
+
+            for (const limit of [0, 1, 5, 17, 1000]) {
+                expect(reader.search(query, { limit })).toEqual(actual.slice(0, limit));
+            }
+            expect(reader.search(query, { limit: 3, dynamicCutoffRatio: 0.2 })).toEqual(
+                reader.search(query, { dynamicCutoffRatio: 0.2 }).slice(0, 3),
+            );
+        }
+    });
+
+    it("keeps ties in first-seen order across repeated searches", () => {
+        const reader = build([
+            [3, "Aleja"],
+            [1, "Aleja"],
+            [2, "Aleja"],
+        ]);
+        const first = reader.search("aleja").map((r) => r.idx);
+        expect(first).toEqual([3, 1, 2]);
+        expect(reader.search("aleja").map((r) => r.idx)).toEqual(first);
+        expect(reader.search("aleja", { limit: 2 }).map((r) => r.idx)).toEqual([3, 1]);
+    });
 });
 
 describe("BucketArrayReader", () => {
@@ -318,5 +463,41 @@ describe("PairIndexReader", () => {
 
     it("returns undefined for a missing pair", () => {
         expect(build([[1, 2, 100]]).find(9, 9)).toBeUndefined();
+    });
+
+    it("finds every pair when one component has very few distinct values", () => {
+        const rows: [number, number, number][] = [];
+        for (let i = 0; i < 5000; i++) rows.push([i, i % 7, i * 3]);
+        const reader = build(rows);
+        for (const [a, b, value] of rows) expect(reader.find(a, b)).toEqual({ value });
+        expect(reader.find(5000, 0)).toBeUndefined();
+        expect(reader.find(0, 7)).toBeUndefined();
+    });
+
+    it("keeps the earlier key placements readable through their own signatures", () => {
+        for (const layout of [1, 2, 3] as const) {
+            const builder = new PairIndexBuilder(columns, new StringInterner(), undefined, layout);
+            builder.add(4, 7, { value: 100 });
+            builder.add(0xffffffff, 0, { value: 200 });
+            const { lookup, columns: cols } = builder.finalize();
+            const reader = new PairIndexReader(
+                new HashLookupReader(lookup.keysLow, lookup.keysHigh, lookup.values),
+                columns,
+                { value: cols[0] as any },
+                makeStringReader(new StringInterner()),
+                layout,
+            );
+            expect(reader.find(4, 7)).toEqual({ value: 100 });
+            expect(reader.find(0xffffffff, 0)).toEqual({ value: 200 });
+            expect(reader.find(7, 4)).toBeUndefined();
+        }
+
+        expect(pairIndex(columns).signature()).toBe("pairIndex3:value=Uint32Array:1");
+        expect(fieldFromSignature("pairIndex2:value=Uint32Array:1").signature()).toBe(
+            "pairIndex2:value=Uint32Array:1",
+        );
+        expect(fieldFromSignature("pairIndex:value=Uint32Array:1").signature()).toBe(
+            "pairIndex:value=Uint32Array:1",
+        );
     });
 });

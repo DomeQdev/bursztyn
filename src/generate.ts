@@ -76,12 +76,12 @@ export const renderField = (signature: string, imports: Set<string>): string => 
         case "multiBucketArray":
             imports.add(kind);
             return `${kind}(${renderColumns(rest, imports)})`;
-        case "pairIndex2":
+        case "pairIndex3":
             imports.add("pairIndex");
             return `pairIndex(${renderColumns(rest, imports)})`;
-        // A legacy "pairIndex:" has no constructor of its own on purpose, so it
-        // falls through to fieldFromSignature() and a mid-chain step keeps
-        // rebuilding the layout the old snapshot actually holds.
+        // A legacy "pairIndex:" or "pairIndex2:" has no constructor of its own
+        // on purpose, so it falls through to fieldFromSignature() and a
+        // mid-chain step keeps rebuilding the layout the old snapshot holds.
         default:
             imports.add("fieldFromSignature");
             return `fieldFromSignature("${signature}")`;

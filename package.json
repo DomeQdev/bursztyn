@@ -1,6 +1,6 @@
 {
     "name": "bursztyn",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "description": "Zero-copy, single-buffer columnar snapshots for TypeScript — typed-array fields, schema hashing, and a built-in migration system. Data, frozen in amber.",
     "keywords": [
         "binary",

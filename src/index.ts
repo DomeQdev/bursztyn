@@ -137,6 +137,7 @@ export {
     TrigramIndexBuilder,
     TrigramIndexReader,
     type MultiBucketArrayReader,
+    type PairKeyLayout,
 } from "./fields.ts";
 
 export {

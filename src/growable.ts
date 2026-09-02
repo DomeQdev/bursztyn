@@ -28,6 +28,16 @@ const INITIAL_CAPACITY = 8;
  *
  * Values are range-checked on the way in, so an overflow throws at the `push`
  * that caused it instead of at `build()`.
+ *
+ * One class serves every element type, so the store in `push` sees as many
+ * typed-array shapes as the schema has numeric kinds. JavaScriptCore degrades
+ * gently with that (about 3 ns → 7 ns per push from one kind to six); V8 stays
+ * flat to four kinds and goes megamorphic at five, where a push costs roughly
+ * ten times what it did. The alternatives were measured and rejected: a class
+ * per kind does not help, because V8 keys type feedback on the closure's
+ * creation site rather than the closure, and both a `DataView` switch and a
+ * hand-written subclass per kind cost the common case on JavaScriptCore two
+ * to three times over to make the rare case on V8 four times better.
  */
 export class NumberBuffer {
     private data: AnyTypedArray;
@@ -166,6 +176,11 @@ export class U32Buffer {
 
     at(index: number): number {
         return this.data[index];
+    }
+
+    /** Overwrite an element already pushed. */
+    set(index: number, value: number) {
+        this.data[index] = value;
     }
 
     last(): number {

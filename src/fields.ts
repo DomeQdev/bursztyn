@@ -300,22 +300,32 @@ const TRIGRAM_LEN = 3;
 const trigramCount = (len: number): number =>
     len === 0 ? 0 : len < TRIGRAM_LEN ? 1 : len - TRIGRAM_LEN + 1;
 
-interface TrigramBucket {
-    lo: number;
-    hi: number;
-    ids: U32Buffer;
-    last: number;
-}
+// The trigram builder's slot table: `[lo, hi, bucket + 1]` per slot, so one
+// probe touches one cache line. Zero in the third word marks an empty slot.
+const TRIGRAM_SLOT = 3;
+const TRIGRAM_INITIAL_SLOTS = 1024;
 
 export class TrigramIndexBuilder {
-    // Keyed by the two halves of the 64-bit trigram hash. This used to be a
-    // Map<bigint, Set<number>>: every trigram of every name allocated a BigInt
-    // just to be hashed, and every posting list was a Set. Two numeric Map
-    // levels and a packed u32 list do the same job without either.
-    private readonly index = new Map<number, Map<number, TrigramBucket>>();
-    private readonly buckets: TrigramBucket[] = [];
+    // Trigram → bucket, open addressed over the two halves of the 64-bit
+    // trigram hash. This used to be a Map<number, Map<number, bucket>> with a
+    // growable list per bucket: two hash lookups and, for a new trigram, a
+    // Map plus an object plus an array — for every trigram of every name. A
+    // flat table and flat postings do the same job with one probe and no
+    // allocation on the path that runs once per trigram.
+    private slots = new Uint32Array(TRIGRAM_INITIAL_SLOTS * TRIGRAM_SLOT);
+    private slotMask = TRIGRAM_INITIAL_SLOTS - 1;
+
+    // Per bucket, in creation order — which is also its id in the index.
+    private readonly bucketLo = new U32Buffer();
+    private readonly bucketHi = new U32Buffer();
+    /** The entity most recently posted to each bucket, plus one; 0 for none. */
+    private readonly bucketLast = new U32Buffer();
+
+    // Postings as they arrive, as (bucket, entity) pairs. `finalize` groups
+    // them by bucket in one counting pass.
+    private readonly postBucket = new U32Buffer();
+    private readonly postEntity = new U32Buffer();
     private maxEntity = -1;
-    private postings = 0;
 
     addEntry(entityIdx: number, name: string) {
         const lower = name.toLowerCase();
@@ -338,58 +348,102 @@ export class TrigramIndexBuilder {
     private addSplit(hashLow: number, hashHigh: number, entityIdx: number) {
         // Same sentinel the table uses: an all-zero key marks an empty slot.
         const lo = hashLow === 0 && hashHigh === 0 ? 1 : hashLow;
+        const hi = hashHigh;
 
-        let byLo = this.index.get(hashHigh);
-        if (byLo === undefined) this.index.set(hashHigh, (byLo = new Map()));
+        const slots = this.slots;
+        const mask = this.slotMask;
+        let slot = lo & mask;
+        let bucket: number;
 
-        let bucket = byLo.get(lo);
-        if (bucket === undefined) {
-            // A trigram bucket almost always holds a handful of postings, so it
-            // starts at a capacity that fits one rather than at zero — which
-            // cost every bucket an empty array plus the first growth.
-            bucket = { lo, hi: hashHigh, ids: new U32Buffer(4), last: -1 };
-            byLo.set(lo, bucket);
-            this.buckets.push(bucket);
+        while (true) {
+            const at = slot * TRIGRAM_SLOT;
+            const stored = slots[at + 2];
+
+            if (stored === 0) {
+                bucket = this.bucketLo.length;
+                this.bucketLo.push(lo);
+                this.bucketHi.push(hi);
+                this.bucketLast.push(0);
+                slots[at] = lo;
+                slots[at + 1] = hi;
+                slots[at + 2] = bucket + 1;
+                if ((bucket + 1) * 2 > mask + 1) this.growSlots();
+                break;
+            }
+
+            if (slots[at] === lo && slots[at + 1] === hi) {
+                bucket = stored - 1;
+                break;
+            }
+
+            slot = (slot + 1) & mask;
         }
 
         // Every trigram of one name is added in one go, so a repeated trigram
         // ("ana" in "banana") always lands back-to-back in its bucket. Catching
         // it here keeps the posting list from carrying duplicates at all.
-        if (bucket.last === entityIdx) return;
-        bucket.last = entityIdx;
-        bucket.ids.push(entityIdx);
-        this.postings++;
+        if (this.bucketLast.at(bucket) === entityIdx + 1) return;
+        this.bucketLast.set(bucket, entityIdx + 1);
+        this.postBucket.push(bucket);
+        this.postEntity.push(entityIdx);
 
         if (entityIdx > this.maxEntity) this.maxEntity = entityIdx;
     }
 
+    private growSlots() {
+        const capacity = (this.slotMask + 1) * 2;
+        const mask = capacity - 1;
+        const slots = new Uint32Array(capacity * TRIGRAM_SLOT);
+        const lo = this.bucketLo.view;
+        const hi = this.bucketHi.view;
+
+        for (let b = 0; b < lo.length; b++) {
+            let slot = lo[b] & mask;
+            while (slots[slot * TRIGRAM_SLOT + 2] !== 0) slot = (slot + 1) & mask;
+            const at = slot * TRIGRAM_SLOT;
+            slots[at] = lo[b];
+            slots[at + 1] = hi[b];
+            slots[at + 2] = b + 1;
+        }
+
+        this.slots = slots;
+        this.slotMask = mask;
+    }
+
     finalize() {
-        const count = this.buckets.length;
-        const lo = new Uint32Array(count);
-        const hi = new Uint32Array(count);
-        const values = new Uint32Array(count);
+        const count = this.bucketLo.length;
+        const postBucket = this.postBucket.view;
+        const postEntity = this.postEntity.view;
+        const postings = postBucket.length;
+
+        // Group the postings by bucket — a counting sort, which keeps each
+        // bucket's postings in the order they arrived.
         const ptr = new Uint32Array(count + 1);
-        const data = new U32Buffer(this.postings);
+        for (let p = 0; p < postings; p++) ptr[postBucket[p] + 1]++;
+        for (let b = 0; b < count; b++) ptr[b + 1] += ptr[b];
+
+        const data = new Uint32Array(postings);
+        const fill = ptr.slice(0, count);
+        for (let p = 0; p < postings; p++) data[fill[postBucket[p]]++] = postEntity[p];
 
         // The back-to-back guard above misses one case: the same entity indexed
         // twice under different names, with another entity in between. Stamping
         // catches it in O(1) per posting — but a sparse id space would make the
         // stamp array larger than the index itself, so that falls back to a Set.
-        const dense = this.maxEntity >= 0 && this.maxEntity + 1 <= this.postings * 4 + 1024;
+        // Duplicates are compacted out in place; `ptr` is rewritten to match.
+        const dense = this.maxEntity >= 0 && this.maxEntity + 1 <= postings * 4 + 1024;
         const stamp = dense ? new Int32Array(this.maxEntity + 1).fill(-1) : null;
         const seen = dense ? null : new Set<number>();
 
+        let out = 0;
         for (let b = 0; b < count; b++) {
-            const bucket = this.buckets[b];
-            lo[b] = bucket.lo;
-            hi[b] = bucket.hi;
-            values[b] = b;
-
-            const ids = bucket.ids.view;
+            const from = ptr[b];
+            const to = ptr[b + 1];
+            ptr[b] = out;
             seen?.clear();
 
-            for (let i = 0; i < ids.length; i++) {
-                const id = ids[i];
+            for (let i = from; i < to; i++) {
+                const id = data[i];
                 if (stamp !== null) {
                     if (stamp[id] === b) continue;
                     stamp[id] = b;
@@ -398,26 +452,30 @@ export class TrigramIndexBuilder {
                 } else {
                     seen!.add(id);
                 }
-                data.push(id);
+                data[out++] = id;
             }
-
-            ptr[b + 1] = data.length;
         }
+        ptr[count] = out;
 
-        const lookup = buildHashTable({ lo, hi, values });
+        const values = new Uint32Array(count);
+        for (let b = 0; b < count; b++) values[b] = b;
+
+        const lookup = buildHashTable({ lo: this.bucketLo.view, hi: this.bucketHi.view, values });
         return {
             keysLow: lookup.keysLow,
             keysHigh: lookup.keysHigh,
             values: lookup.values,
             ptr,
-            data: data.view,
+            data: data.subarray(0, out),
         };
     }
 }
 
 export class TrigramIndexReader {
-    private scores: Uint32Array | null = null;
-    private stamp: Int32Array | null = null;
+    // Per entity, `[generation, score]` side by side at `2 * id`. Separate
+    // stamp and score arrays cost a posting two cache misses on a big index;
+    // one line holds both halves of the same entry.
+    private dense: Int32Array | null = null;
     private matches: Map<number, number> | null = null;
     private generation = 0;
 
@@ -444,10 +502,30 @@ export class TrigramIndexReader {
         const trigrams = trigramCount(len);
         if (trigrams === 0) return [];
 
-        if (this.scores === null && this.matches === null) this.prepareScratch();
+        const ratio = opts.dynamicCutoffRatio ?? 0.7;
 
-        const scores = this.scores;
-        const stamp = this.stamp;
+        // One trigram — the first keystrokes of a type-ahead, which also hit
+        // the longest posting lists — needs no scoring: every posting scores 1,
+        // ties keep the list's own order, and the cutoff is 1 unless the ratio
+        // is asked to exceed the best score.
+        if (trigrams === 1) {
+            if (ratio > 1) return [];
+            hashChars(lower, 0, len);
+            const bucketIdx = this.findBucket(hashState.lo, hashState.hi);
+            if (bucketIdx === -1) return [];
+
+            const from = this.ptr[bucketIdx];
+            const total = this.ptr[bucketIdx + 1] - from;
+            const take = opts.limit !== undefined && opts.limit < total ? Math.max(0, opts.limit) : total;
+            const data = this.data;
+            const results: { idx: number; score: number }[] = new Array(take);
+            for (let i = 0; i < take; i++) results[i] = { idx: data[from + i], score: 1 };
+            return results;
+        }
+
+        if (this.dense === null && this.matches === null) this.prepareScratch();
+
+        const dense = this.dense;
         const matches = this.matches;
         const generation = this.nextGeneration();
         matches?.clear();
@@ -470,13 +548,15 @@ export class TrigramIndexReader {
                 const id = data[i];
                 let score: number;
 
-                if (scores !== null) {
-                    if (stamp![id] !== generation) {
-                        stamp![id] = generation;
-                        scores[id] = 0;
+                if (dense !== null) {
+                    const at = id * 2;
+                    if (dense[at] !== generation) {
+                        dense[at] = generation;
+                        dense[at + 1] = score = 1;
                         this.touch(id);
+                    } else {
+                        score = ++dense[at + 1];
                     }
-                    score = ++scores[id];
                 } else {
                     score = (matches!.get(id) ?? 0) + 1;
                     if (score === 1) this.touch(id);
@@ -488,20 +568,54 @@ export class TrigramIndexReader {
         }
 
         const minMatches = Math.max(1, trigrams - 1);
-        const cutoff = Math.max(minMatches, maxScore * (opts.dynamicCutoffRatio ?? 0.7));
-        const results: { idx: number; score: number }[] = [];
+        const cutoff = Math.max(minMatches, maxScore * ratio);
+        const lowest = Math.ceil(cutoff);
+        if (lowest > maxScore) return [];
 
+        // A score is a count of matched trigrams, so it is a small integer and
+        // the ranking is a counting sort: one histogram, one scatter. This used
+        // to build a `{ idx, score }` per candidate and hand the lot to a
+        // comparator sort — for a two-letter prefix over a big index that was
+        // tens of thousands of objects per keystroke, thrown away by `limit`
+        // a moment later. Ties keep the order the ids were first touched in,
+        // exactly what the stable sort produced.
         const touched = this.touched;
-        for (let i = 0; i < this.touchedCount; i++) {
+        const touchedCount = this.touchedCount;
+        const counts = this.histogram(maxScore);
+
+        let total = 0;
+        for (let i = 0; i < touchedCount; i++) {
             const idx = touched[i];
-            const score = scores !== null ? scores[idx] : matches!.get(idx)!;
-            if (score >= cutoff) results.push({ idx, score });
+            const score = dense !== null ? dense[idx * 2 + 1] : matches!.get(idx)!;
+            if (score >= lowest) {
+                counts[score]++;
+                total++;
+            }
         }
 
-        results.sort((a, b) => b.score - a.score);
+        // Turn counts into the start offset of each score's run, best first.
+        let running = 0;
+        for (let score = maxScore; score >= lowest; score--) {
+            const count = counts[score];
+            counts[score] = running;
+            running += count;
+        }
 
-        if (opts.limit !== undefined && results.length > opts.limit) {
-            results.length = opts.limit;
+        const ordered = this.orderedScratch(total);
+        for (let i = 0; i < touchedCount; i++) {
+            const idx = touched[i];
+            const score = dense !== null ? dense[idx * 2 + 1] : matches!.get(idx)!;
+            if (score >= lowest) ordered[counts[score]++] = idx;
+        }
+
+        const take = opts.limit !== undefined && opts.limit < total ? Math.max(0, opts.limit) : total;
+        const results: { idx: number; score: number }[] = new Array(take);
+        let out = 0;
+        let from = 0;
+        for (let score = maxScore; score >= lowest && out < take; score--) {
+            const to = counts[score];
+            for (let p = from; p < to && out < take; p++) results[out++] = { idx: ordered[p], score };
+            from = to;
         }
 
         return results;
@@ -514,6 +628,28 @@ export class TrigramIndexReader {
             this.touched = grown;
         }
         this.touched[this.touchedCount++] = id;
+    }
+
+    // Both scratch arrays live on the reader for the same reason `touched`
+    // does: a type-ahead calls `search` once per keystroke.
+    private counts = new Uint32Array(0);
+    private ordered = new Uint32Array(0);
+
+    /** A zeroed histogram with room for scores `0..maxScore`. */
+    private histogram(maxScore: number): Uint32Array {
+        if (this.counts.length <= maxScore) {
+            this.counts = new Uint32Array(Math.max(maxScore + 1, 16));
+        } else {
+            this.counts.fill(0, 0, maxScore + 1);
+        }
+        return this.counts;
+    }
+
+    private orderedScratch(size: number): Uint32Array {
+        if (this.ordered.length < size) {
+            this.ordered = new Uint32Array(Math.max(size, this.ordered.length * 2, 64));
+        }
+        return this.ordered;
     }
 
     /**
@@ -531,8 +667,7 @@ export class TrigramIndexReader {
         }
 
         if (max >= 0 && max + 1 <= data.length * 4 + 1024) {
-            this.scores = new Uint32Array(max + 1);
-            this.stamp = new Int32Array(max + 1);
+            this.dense = new Int32Array((max + 1) * 2);
         } else {
             this.matches = new Map();
         }
@@ -540,7 +675,7 @@ export class TrigramIndexReader {
 
     private nextGeneration(): number {
         if (this.generation === 0x7fffffff) {
-            this.stamp?.fill(0);
+            this.dense?.fill(0);
             this.generation = 0;
         }
         return ++this.generation;
@@ -1065,18 +1200,42 @@ class KeyedIndexField<S extends ColumnSpec> implements Field<KeyedIndexBuilder<S
 export const keyedIndex = <S extends ColumnSpec>(spec: S) => new KeyedIndexField(spec);
 
 /**
+ * Which generation of key placement a pair index uses. The number is part of
+ * the signature (`pairIndex`, `pairIndex2`, `pairIndex3`), so a snapshot is
+ * always probed the way it was built; only the newest is ever written.
+ */
+export type PairKeyLayout = 1 | 2 | 3;
+
+const PAIR_KEY_LAYOUT: PairKeyLayout = 3;
+
+const pairSignature = (layout: PairKeyLayout): string =>
+    layout === 1 ? "pairIndex" : `pairIndex${layout}`;
+
+/**
  * The (a, b) pair as the two halves of a table key.
  *
  * `fmix32` is murmur's avalanche and is a bijection, so distinct pairs stay
  * distinct — a hit on both halves is still an exact match, and `find` needs no
  * verification column. What it buys is the *placement*: the table probes from
- * `lo & mask`, and feeding `b` in raw meant a column of structured ids — times
- * on a minute grid, keys with zeroed low bits — landed on every fourth slot and
- * clustered under linear probing. `a + 1` keeps the high half off zero so an
- * ordinary pair never hits the empty-slot sentinel.
+ * `lo & mask`, so everything about a lookup's cost is in how `lo` is made.
+ *
+ * Layout 1 fed `b` in raw, and a column of structured ids — times on a minute
+ * grid, keys with zeroed low bits — landed on every fourth slot and clustered.
+ * Layout 2 mixed `b`, which fixed the structure but not the cardinality: the
+ * slot still depended on `b` alone, so a million (route, stopSeq) pairs with
+ * fifty distinct `stopSeq` values formed fifty probe chains of twenty thousand
+ * entries each, and `find` walked half a chain on average. Layout 3 folds the
+ * high half into the low one first, so both components spread the placement.
+ * It stays a bijection: `hi` fixes `a`, and for a fixed `a` the low half is a
+ * bijection of `b`. `a + 1` keeps the high half off zero so an ordinary pair
+ * never hits the empty-slot sentinel.
  */
-const pairKey = (a: number, b: number, mixed: boolean): void => {
-    if (mixed) {
+const pairKey = (a: number, b: number, layout: PairKeyLayout): void => {
+    if (layout === 3) {
+        const hi = fmix32((a + 1) >>> 0);
+        hashState.hi = hi;
+        hashState.lo = fmix32((b ^ hi) >>> 0);
+    } else if (layout === 2) {
         hashState.lo = fmix32(b >>> 0);
         hashState.hi = fmix32((a + 1) >>> 0);
     } else {
@@ -1094,13 +1253,13 @@ export class PairIndexBuilder<C extends Columns> {
         columns: C,
         strings: StringInterner,
         label?: string,
-        private readonly mixed: boolean = true,
+        private readonly layout: PairKeyLayout = PAIR_KEY_LAYOUT,
     ) {
         this.store = new ColumnStore(columns, strings, label);
     }
 
     add(a: number, b: number, item: { [K in keyof C]: ColumnWriteValue<C[K]> }) {
-        pairKey(a, b, this.mixed);
+        pairKey(a, b, this.layout);
         this.lookup.addSplit(hashState.lo, hashState.hi, this.count);
         this.store.push(item);
         this.count++;
@@ -1123,14 +1282,14 @@ export class PairIndexReader<C extends Columns> {
         columns: C,
         private views: { [K in keyof C]: ColumnView<C[K]> },
         private strings: StringReader,
-        private readonly mixed: boolean = true,
+        private readonly layout: PairKeyLayout = PAIR_KEY_LAYOUT,
     ) {
         this.keys = Object.keys(columns);
         this.specs = this.keys.map((key) => columns[key]);
     }
 
     find(a: number, b: number): { [K in keyof C]: ColumnReadValue<C[K]> } | undefined {
-        pairKey(a, b, this.mixed);
+        pairKey(a, b, this.layout);
         const idx = this.lookup.findByHashSplit(hashState.lo, hashState.hi);
         if (idx === undefined) return undefined;
 
@@ -1148,18 +1307,18 @@ class PairIndexField<C extends Columns> implements Field<PairIndexBuilder<C>, Pa
     readonly sectionCount: number;
     constructor(
         private columns: C,
-        private readonly mixed: boolean = true,
+        private readonly layout: PairKeyLayout = PAIR_KEY_LAYOUT,
     ) {
         this.sectionCount = 3 + Object.keys(columns).length;
     }
     signature() {
-        // Where the entries land in the table is part of the snapshot, and the
-        // unmixed placement is not the mixed one — so it gets its own name
-        // rather than being read back wrong under the old one.
-        return `${this.mixed ? "pairIndex2" : "pairIndex"}:${columnsSignature(this.columns)}`;
+        // Where the entries land in the table is part of the snapshot, and one
+        // placement is not another — so each gets its own name rather than
+        // being read back wrong under an older one.
+        return `${pairSignature(this.layout)}:${columnsSignature(this.columns)}`;
     }
     createBuilder(ctx: BuilderContext) {
-        return new PairIndexBuilder(this.columns, ctx.strings, ctx.name, this.mixed);
+        return new PairIndexBuilder(this.columns, ctx.strings, ctx.name, this.layout);
     }
     finalize(builder: PairIndexBuilder<C>): FieldSection[] {
         const { lookup, columns } = builder.finalize();
@@ -1177,15 +1336,17 @@ class PairIndexField<C extends Columns> implements Field<PairIndexBuilder<C>, Pa
             ctx.view(2, Uint32Array),
         );
         const views = readColumns(this.columns, ctx, 3);
-        return new PairIndexReader(lookup, this.columns, views, ctx.strings, this.mixed);
+        return new PairIndexReader(lookup, this.columns, views, ctx.strings, this.layout);
     }
 }
 
 export const pairIndex = <C extends Columns>(columns: C) => new PairIndexField(columns);
 
 /**
- * The pre-`pairIndex2` layout, which keyed the table on the raw pair. Reachable
- * only through a snapshot's own manifest, so an existing file stays readable
- * and — more to the point — stays migratable.
+ * An earlier placement — `pairIndex` keyed the table on the raw pair,
+ * `pairIndex2` on the mixed halves. Reachable only through a snapshot's own
+ * manifest, so an existing file stays readable and — more to the point —
+ * stays migratable.
  */
-export const pairIndexLegacy = <C extends Columns>(columns: C) => new PairIndexField(columns, false);
+export const pairIndexLegacy = <C extends Columns>(columns: C, layout: Exclude<PairKeyLayout, 3> = 1) =>
+    new PairIndexField(columns, layout);

@@ -44,6 +44,39 @@ export const hashChars = (s: string, start: number, end: number): void => {
 
 export const hashString = (s: string): void => hashChars(s, 0, s.length);
 
+/**
+ * `hashChars` over up to three code units handed in directly — what the
+ * trigram builder has once it has lowercased a name per character instead of
+ * as a whole. Must stay byte-for-byte identical to `hashChars` on the
+ * equivalent string: the reader hashes its query through `hashChars` and the
+ * snapshot stores what the builder computed here.
+ */
+export const hashTrigram = (c0: number, c1: number, c2: number, length: number): void => {
+    let h1 = 0x9747b28c | 0;
+    let h2 = 0x2f2fdd8b | 0;
+
+    for (let i = 0; i < length; i++) {
+        const c = i === 0 ? c0 : i === 1 ? c1 : c2;
+
+        let k1 = Math.imul(c, 0xcc9e2d51);
+        k1 = (k1 << 15) | (k1 >>> 17);
+        k1 = Math.imul(k1, 0x1b873593);
+        h1 ^= k1;
+        h1 = (h1 << 13) | (h1 >>> 19);
+        h1 = (Math.imul(h1, 5) + 0xe6546b64) | 0;
+
+        let k2 = Math.imul(c ^ 0x5bd1e995, 0x85ebca6b);
+        k2 = (k2 << 17) | (k2 >>> 15);
+        k2 = Math.imul(k2, 0xc2b2ae35);
+        h2 ^= k2;
+        h2 = (h2 << 11) | (h2 >>> 21);
+        h2 = (Math.imul(h2, 5) + 0x38495ab5) | 0;
+    }
+
+    hashState.lo = fmix32(h1 ^ length);
+    hashState.hi = fmix32(((h2 ^ length) + h1) | 0);
+};
+
 export const splitHash = (hash: bigint): void => {
     hashState.lo = Number(hash & 0xffffffffn) >>> 0;
     hashState.hi = Number((hash >> 32n) & 0xffffffffn) >>> 0;

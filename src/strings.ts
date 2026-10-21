@@ -180,6 +180,29 @@ export class StringInterner {
 
         for (let i = 0; i < list.length; i++) {
             const s = list[i];
+            const len = s.length;
+
+            // An ASCII string is its own UTF-8, so its code units go straight
+            // into the buffer. Routing every string through `encodeInto` cost
+            // about 100 ns of call overhead apiece — on a million short ids
+            // that was the whole price of the string table, three times over.
+            if (pos + len > buf.length) {
+                const grown = new Uint8Array(Math.max(buf.length * 2, pos + len * 3));
+                grown.set(buf.subarray(0, pos));
+                buf = grown;
+            }
+
+            let j = 0;
+            for (; j < len; j++) {
+                const c = s.charCodeAt(j);
+                if (c > 0x7f) break;
+                buf[pos + j] = c;
+            }
+            if (j === len) {
+                pos += len;
+                offsets[carried + i + 1] = pos;
+                continue;
+            }
 
             // encodeInto stops on a code-point boundary when it runs out of room
             // and reports how far it got — cheaper than reserving the worst case

@@ -19,6 +19,7 @@ import {
     u32,
 } from "./index.ts";
 import { StringInterner, StringReader } from "./strings.ts";
+import { hashStringToBigint } from "./hash.ts";
 
 const makeStringReader = (interner: StringInterner): StringReader => {
     const { offsets, data } = interner.serialize();
@@ -58,6 +59,34 @@ describe("StringInterner", () => {
         expect(reader.get(0)).toBe("");
         expect(reader.get(kr)).toBe("Kraków");
         expect(reader.get(emoji)).toBe("🚋 tram");
+    });
+
+    it("serializes ASCII and multi-byte strings through the same offsets", () => {
+        // ASCII takes the direct path; anything else goes through the encoder,
+        // and the buffer is sized for the ASCII floor so the multi-byte ones
+        // force it to grow mid-table.
+        const interner = new StringInterner();
+        const values = [
+            "plain",
+            "zażółć gęślą jaźń",
+            "ascii then ż",
+            "🚋🚋🚋",
+            "",
+            "x".repeat(300),
+            "ё".repeat(300),
+            "mixed ü ascii end",
+        ];
+        const ids = values.map((value) => interner.add(value));
+        const { offsets, data } = interner.serialize();
+        const reader = new StringReader(offsets, data);
+
+        expect(offsets.length).toBe(interner.size + 1);
+        expect(offsets[offsets.length - 1]).toBe(data.byteLength);
+        for (let i = 0; i < values.length; i++) {
+            expect(reader.get(ids[i])).toBe(values[i]);
+            expect(reader.equals(ids[i], values[i])).toBe(true);
+        }
+        expect(data).toEqual(new TextEncoder().encode(values.filter((v) => v !== "").join("")));
     });
 
     it("returns empty string for out-of-range ids", () => {
@@ -353,6 +382,68 @@ describe("TrigramIndexReader", () => {
         }
     });
 
+    it("builds the same index from text as from precomputed trigram hashes", () => {
+        // addEntry lowercases ASCII per code unit and hashes code units
+        // directly; addHash is the reference path through hashString. Both
+        // must land every trigram in the same bucket, byte for byte.
+        const names = ["Dworzec GŁÓWNY", "ŻABKA", "Rondo ONZ", "ab", "a", "banana", "İstanbul", "Plac Zamkowy"];
+        const viaText = new TrigramIndexBuilder();
+        const viaHash = new TrigramIndexBuilder();
+
+        names.forEach((name, idx) => {
+            viaText.addEntry(idx, name);
+            for (const trigram of trigramsOf(name)) viaHash.addHash(hashStringToBigint(trigram), idx);
+        });
+
+        const a = viaText.finalize();
+        const b = viaHash.finalize();
+        expect(a.keysLow).toEqual(b.keysLow);
+        expect(a.keysHigh).toEqual(b.keysHigh);
+        expect(a.values).toEqual(b.values);
+        expect(a.ptr).toEqual(b.ptr);
+        expect(a.data).toEqual(b.data);
+    });
+
+    it("matches regardless of case, in ASCII and beyond", () => {
+        const reader = build([
+            [0, "BANANA"],
+            [1, "banana"],
+            [2, "ŻÓŁW"],
+            [3, "żółw"],
+        ]);
+        expect(reader.search("Banana").map((r) => r.idx)).toEqual([0, 1]);
+        expect(reader.search("żółw").map((r) => r.idx)).toEqual([2, 3]);
+        expect(reader.search("ŻÓŁW").map((r) => r.score)).toEqual([2, 2]);
+    });
+
+    it("returns nothing when two of the query's trigrams are unknown", () => {
+        const reader = build([[0, "Rondo ONZ"]]);
+        expect(reader.search("Ronxxo")).toEqual([]);
+        expect(reader.search("Rondq").map((r) => r.idx)).toEqual([0]);
+    });
+
+    it("scores sparse entity ids the same way as dense ones", () => {
+        // Ids far apart push the reader onto its Map scratch instead of the
+        // typed-array one; the candidate rule has to hold on both.
+        const sparse = build([
+            [0, "Rondo ONZ"],
+            [5_000_000, "Rondo ONZ"],
+            [50_000_000, "Rondo Daszyńskiego"],
+            [900_000_000, "Ogród Saski"],
+        ]);
+        const dense = build([
+            [0, "Rondo ONZ"],
+            [1, "Rondo ONZ"],
+            [2, "Rondo Daszyńskiego"],
+            [3, "Ogród Saski"],
+        ]);
+        for (const query of ["rondo onz", "rondo", "rondo da", "saski", "zzz"]) {
+            expect(sparse.search(query).map((r) => r.score)).toEqual(dense.search(query).map((r) => r.score));
+        }
+        expect(sparse.search("rondo onz").map((r) => r.idx)).toEqual([0, 5_000_000]);
+        expect(sparse.search("rondo").map((r) => r.idx)).toEqual([0, 5_000_000, 50_000_000]);
+    });
+
     it("keeps ties in first-seen order across repeated searches", () => {
         const reader = build([
             [3, "Aleja"],
@@ -472,6 +563,17 @@ describe("PairIndexReader", () => {
         for (const [a, b, value] of rows) expect(reader.find(a, b)).toEqual({ value });
         expect(reader.find(5000, 0)).toBeUndefined();
         expect(reader.find(0, 7)).toBeUndefined();
+    });
+
+    it("exposes the row index and the raw columns for allocation-free reads", () => {
+        const reader = build([
+            [1, 2, 100],
+            [3, 4, 200],
+        ]);
+        const row = reader.findIndex(3, 4)!;
+        expect(reader.columns.value[row]).toBe(200);
+        expect(reader.columns.value).toBeInstanceOf(Uint32Array);
+        expect(reader.findIndex(4, 3)).toBeUndefined();
     });
 
     it("keeps the earlier key placements readable through their own signatures", () => {

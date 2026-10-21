@@ -1,6 +1,6 @@
 import type { BuilderContext, Field, FieldSection, ReaderContext, TypedArrayConstructor } from "./types.ts";
 import type { AnyTypedArray } from "./types.ts";
-import { fmix32, hashChars, hashState, hashString, splitHash } from "./hash.ts";
+import { fmix32, hashChars, hashState, hashString, hashTrigram, splitHash } from "./hash.ts";
 import { NumberBuffer, U32Buffer } from "./growable.ts";
 import { StringInterner, StringReader } from "./strings.ts";
 import {
@@ -300,10 +300,17 @@ const TRIGRAM_LEN = 3;
 const trigramCount = (len: number): number =>
     len === 0 ? 0 : len < TRIGRAM_LEN ? 1 : len - TRIGRAM_LEN + 1;
 
-// The trigram builder's slot table: `[lo, hi, bucket + 1]` per slot, so one
+// The trigram builder's slot tables: `[lo, hi, bucket + 1]` per slot, so one
 // probe touches one cache line. Zero in the third word marks an empty slot.
 const TRIGRAM_SLOT = 3;
 const TRIGRAM_INITIAL_SLOTS = 1024;
+
+const lowerAscii = (c: number): number => (c >= 65 && c <= 90 ? c + 32 : c);
+
+// Where a trigram's own code units land in the builder's text table. Only the
+// placement — a hit is confirmed on both key words — so a cheap mix will do.
+const charSlot = (keyLo: number, keyHi: number): number =>
+    Math.imul(keyLo ^ Math.imul(keyHi, 0x9e3779b1), 0x85ebca6b) >>> 7;
 
 export class TrigramIndexBuilder {
     // Trigram → bucket, open addressed over the two halves of the 64-bit
@@ -314,6 +321,16 @@ export class TrigramIndexBuilder {
     // allocation on the path that runs once per trigram.
     private slots = new Uint32Array(TRIGRAM_INITIAL_SLOTS * TRIGRAM_SLOT);
     private slotMask = TRIGRAM_INITIAL_SLOTS - 1;
+
+    // The same mapping keyed by the trigram's code units rather than its hash:
+    // `[c0 | c1 << 16, c2 | length << 16, bucket + 1]`. The snapshot is read
+    // by hash, but it is built from text, and a name's trigrams are nearly all
+    // ones the index has seen before — so the 64-bit hash is computed once per
+    // distinct trigram, when its bucket is created, instead of once per
+    // occurrence. That took about a third off indexing a million names.
+    private charSlots = new Uint32Array(TRIGRAM_INITIAL_SLOTS * TRIGRAM_SLOT);
+    private charMask = TRIGRAM_INITIAL_SLOTS - 1;
+    private charCount = 0;
 
     // Per bucket, in creation order — which is also its id in the index.
     private readonly bucketLo = new U32Buffer();
@@ -328,24 +345,74 @@ export class TrigramIndexBuilder {
     private maxEntity = -1;
 
     addEntry(entityIdx: number, name: string) {
-        const lower = name.toLowerCase();
+        // An ASCII name is lowercased one code unit at a time on its way into
+        // the key, so the common case never allocates a lowered copy. Anything
+        // else goes through `toLowerCase()`, which is allowed to change the
+        // length (U+0130 becomes two code units), so the trigram walk is over
+        // the lowered string, exactly as the reader walks its query.
+        let lower = name;
+        let ascii = true;
+        for (let i = 0; i < name.length; i++) {
+            if (name.charCodeAt(i) > 0x7f) {
+                ascii = false;
+                break;
+            }
+        }
+        if (!ascii) lower = name.toLowerCase();
+
         const len = lower.length;
         const count = trigramCount(len);
+        const width = len < TRIGRAM_LEN ? len : TRIGRAM_LEN;
 
         for (let t = 0; t < count; t++) {
-            // Hashing the slice in place — `substring(i, i + 3)` allocated one
-            // throwaway string per character of every name in the index.
-            hashChars(lower, len < TRIGRAM_LEN ? 0 : t, len < TRIGRAM_LEN ? len : t + TRIGRAM_LEN);
-            this.addSplit(hashState.lo, hashState.hi, entityIdx);
+            let c0 = lower.charCodeAt(t);
+            let c1 = width > 1 ? lower.charCodeAt(t + 1) : 0;
+            let c2 = width > 2 ? lower.charCodeAt(t + 2) : 0;
+            if (ascii) {
+                c0 = lowerAscii(c0);
+                c1 = lowerAscii(c1);
+                c2 = lowerAscii(c2);
+            }
+            this.post(this.bucketOfChars(c0, c1, c2, width), entityIdx);
         }
     }
 
     addHash(hash: bigint, entityIdx: number) {
         splitHash(hash);
-        this.addSplit(hashState.lo, hashState.hi, entityIdx);
+        this.post(this.bucketOfHash(hashState.lo, hashState.hi), entityIdx);
     }
 
-    private addSplit(hashLow: number, hashHigh: number, entityIdx: number) {
+    private bucketOfChars(c0: number, c1: number, c2: number, width: number): number {
+        const keyLo = (c0 | (c1 << 16)) >>> 0;
+        const keyHi = (c2 | (width << 16)) >>> 0;
+
+        const slots = this.charSlots;
+        const mask = this.charMask;
+        let slot = charSlot(keyLo, keyHi) & mask;
+
+        while (true) {
+            const at = slot * TRIGRAM_SLOT;
+            const stored = slots[at + 2];
+            if (stored === 0) break;
+            if (slots[at] === keyLo && slots[at + 1] === keyHi) return stored - 1;
+            slot = (slot + 1) & mask;
+        }
+
+        // First sighting: hash it the way the reader will, and remember the
+        // bucket under the text key so no later occurrence pays for the hash.
+        hashTrigram(c0, c1, c2, width);
+        const bucket = this.bucketOfHash(hashState.lo, hashState.hi);
+
+        const at = slot * TRIGRAM_SLOT;
+        slots[at] = keyLo;
+        slots[at + 1] = keyHi;
+        slots[at + 2] = bucket + 1;
+        if (++this.charCount * 2 > mask + 1) this.growCharSlots();
+
+        return bucket;
+    }
+
+    private bucketOfHash(hashLow: number, hashHigh: number): number {
         // Same sentinel the table uses: an all-zero key marks an empty slot.
         const lo = hashLow === 0 && hashHigh === 0 ? 1 : hashLow;
         const hi = hashHigh;
@@ -353,14 +420,13 @@ export class TrigramIndexBuilder {
         const slots = this.slots;
         const mask = this.slotMask;
         let slot = lo & mask;
-        let bucket: number;
 
         while (true) {
             const at = slot * TRIGRAM_SLOT;
             const stored = slots[at + 2];
 
             if (stored === 0) {
-                bucket = this.bucketLo.length;
+                const bucket = this.bucketLo.length;
                 this.bucketLo.push(lo);
                 this.bucketHi.push(hi);
                 this.bucketLast.push(0);
@@ -368,17 +434,16 @@ export class TrigramIndexBuilder {
                 slots[at + 1] = hi;
                 slots[at + 2] = bucket + 1;
                 if ((bucket + 1) * 2 > mask + 1) this.growSlots();
-                break;
+                return bucket;
             }
 
-            if (slots[at] === lo && slots[at + 1] === hi) {
-                bucket = stored - 1;
-                break;
-            }
+            if (slots[at] === lo && slots[at + 1] === hi) return stored - 1;
 
             slot = (slot + 1) & mask;
         }
+    }
 
+    private post(bucket: number, entityIdx: number) {
         // Every trigram of one name is added in one go, so a repeated trigram
         // ("ana" in "banana") always lands back-to-back in its bucket. Catching
         // it here keeps the posting list from carrying duplicates at all.
@@ -408,6 +473,29 @@ export class TrigramIndexBuilder {
 
         this.slots = slots;
         this.slotMask = mask;
+    }
+
+    private growCharSlots() {
+        const capacity = (this.charMask + 1) * 2;
+        const mask = capacity - 1;
+        const old = this.charSlots;
+        const slots = new Uint32Array(capacity * TRIGRAM_SLOT);
+
+        for (let from = 0; from < old.length; from += TRIGRAM_SLOT) {
+            const stored = old[from + 2];
+            if (stored === 0) continue;
+            const keyLo = old[from];
+            const keyHi = old[from + 1];
+            let slot = charSlot(keyLo, keyHi) & mask;
+            while (slots[slot * TRIGRAM_SLOT + 2] !== 0) slot = (slot + 1) & mask;
+            const at = slot * TRIGRAM_SLOT;
+            slots[at] = keyLo;
+            slots[at + 1] = keyHi;
+            slots[at + 2] = stored;
+        }
+
+        this.charSlots = slots;
+        this.charMask = mask;
     }
 
     finalize() {
@@ -479,11 +567,22 @@ export class TrigramIndexReader {
     private matches: Map<number, number> | null = null;
     private generation = 0;
 
+    // One bit per entity, set while it is a candidate of the current query.
+    // The lists that only score (see `search`) test this before touching
+    // `dense`: 128 KB per million entities stays in L2, the 8 MB of scores
+    // does not. Dense mode only; the Map path is its own membership test.
+    private bits: Uint32Array | null = null;
+
     // The ids this query scored, so the result sweep visits only them. Kept on
     // the reader and refilled per search: a fresh array per query handed the
     // collector one more thing to reclaim on every keystroke of a type-ahead.
     private touched = new Uint32Array(0);
     private touchedCount = 0;
+
+    // The posting-list bounds of the current query's trigrams, resolved up
+    // front so the scoring passes can be ordered. Reused across searches.
+    private listFrom = new Uint32Array(0);
+    private listTo = new Uint32Array(0);
 
     constructor(
         private keysLow: Uint32Array,
@@ -508,65 +607,68 @@ export class TrigramIndexReader {
         // the longest posting lists — needs no scoring: every posting scores 1,
         // ties keep the list's own order, and the cutoff is 1 unless the ratio
         // is asked to exceed the best score.
-        if (trigrams === 1) {
-            if (ratio > 1) return [];
-            hashChars(lower, 0, len);
-            const bucketIdx = this.findBucket(hashState.lo, hashState.hi);
-            if (bucketIdx === -1) return [];
-
-            const from = this.ptr[bucketIdx];
-            const total = this.ptr[bucketIdx + 1] - from;
-            const take = opts.limit !== undefined && opts.limit < total ? Math.max(0, opts.limit) : total;
-            const data = this.data;
-            const results: { idx: number; score: number }[] = new Array(take);
-            for (let i = 0; i < take; i++) results[i] = { idx: data[from + i], score: 1 };
-            return results;
-        }
+        if (trigrams === 1) return ratio > 1 ? [] : this.searchSingle(lower, len, opts.limit);
 
         if (this.dense === null && this.matches === null) this.prepareScratch();
 
         const dense = this.dense;
-        const matches = this.matches;
         const generation = this.nextGeneration();
-        matches?.clear();
+        this.matches?.clear();
 
         const ptr = this.ptr;
-        const data = this.data;
         this.touchedCount = 0;
-        let maxScore = 0;
+
+        // Resolve every trigram's posting list first. The cutoff below is
+        // never lower than `trigrams - 1`, so a name has to appear in all the
+        // lists but one — which means it appears in at least one of *any two*
+        // of them. So only the first two lists admit new candidates; the rest
+        // merely score the ones already admitted, and never touch an id that
+        // could not qualify. On a long query over a big index most postings
+        // are such ids, and admitting each cost a write to `dense` plus a
+        // `touched` slot plus a visit in the result sweep. For the same
+        // reason two lists the index has never seen settle the query at once.
+        // The order the lists are scored in is unchanged, so ties still come
+        // out in first-seen order.
+        if (this.listFrom.length < trigrams) {
+            this.listFrom = new Uint32Array(trigrams * 2);
+            this.listTo = new Uint32Array(trigrams * 2);
+        }
+        const listFrom = this.listFrom;
+        const listTo = this.listTo;
+        let missing = 0;
 
         for (let t = 0; t < trigrams; t++) {
             hashChars(lower, len < TRIGRAM_LEN ? 0 : t, len < TRIGRAM_LEN ? len : t + TRIGRAM_LEN);
-
             const bucketIdx = this.findBucket(hashState.lo, hashState.hi);
-            if (bucketIdx === -1) continue;
-
-            const from = ptr[bucketIdx];
-            const to = ptr[bucketIdx + 1];
-
-            for (let i = from; i < to; i++) {
-                const id = data[i];
-                let score: number;
-
-                if (dense !== null) {
-                    const at = id * 2;
-                    if (dense[at] !== generation) {
-                        dense[at] = generation;
-                        dense[at + 1] = score = 1;
-                        this.touch(id);
-                    } else {
-                        score = ++dense[at + 1];
-                    }
-                } else {
-                    score = (matches!.get(id) ?? 0) + 1;
-                    if (score === 1) this.touch(id);
-                    matches!.set(id, score);
-                }
-
-                if (score > maxScore) maxScore = score;
+            if (bucketIdx === -1) {
+                missing++;
+                listFrom[t] = 0;
+                listTo[t] = 0;
+            } else {
+                listFrom[t] = ptr[bucketIdx];
+                listTo[t] = ptr[bucketIdx + 1];
             }
         }
+        if (missing >= 2) return [];
 
+        // The scoring loops are methods of their own rather than inlined here:
+        // with them inline this function grew past what JavaScriptCore will
+        // take to its top tier, and every query — including the one-trigram
+        // path above, which had not changed — ran slower on Bun.
+        let maxScore = 0;
+        for (let t = 0; t < trigrams; t++) {
+            const admit = t < 2;
+            if (dense !== null) {
+                maxScore = admit
+                    ? this.admitDense(listFrom[t], listTo[t], generation, maxScore)
+                    : this.scoreDense(listFrom[t], listTo[t], maxScore);
+            } else {
+                maxScore = this.scoreSparse(listFrom[t], listTo[t], admit, maxScore);
+            }
+        }
+        if (dense !== null) this.clearBits();
+
+        const matches = this.matches;
         const minMatches = Math.max(1, trigrams - 1);
         const cutoff = Math.max(minMatches, maxScore * ratio);
         const lowest = Math.ceil(cutoff);
@@ -621,6 +723,94 @@ export class TrigramIndexReader {
         return results;
     }
 
+    // One trigram — the first keystrokes of a type-ahead, which also hit the
+    // longest posting lists — needs no scoring: every posting scores 1, ties
+    // keep the list's own order, and the cutoff is 1 unless the ratio is
+    // asked to exceed the best score (the caller has already returned then).
+    private searchSingle(lower: string, len: number, limit: number | undefined): { idx: number; score: number }[] {
+        hashChars(lower, 0, len);
+        const bucketIdx = this.findBucket(hashState.lo, hashState.hi);
+        if (bucketIdx === -1) return [];
+
+        const from = this.ptr[bucketIdx];
+        const total = this.ptr[bucketIdx + 1] - from;
+        const take = limit !== undefined && limit < total ? Math.max(0, limit) : total;
+        const data = this.data;
+        const results: { idx: number; score: number }[] = new Array(take);
+        for (let i = 0; i < take; i++) results[i] = { idx: data[from + i], score: 1 };
+        return results;
+    }
+
+    /** Score one posting list, admitting every id in it as a candidate. */
+    private admitDense(from: number, to: number, generation: number, maxScore: number): number {
+        const data = this.data;
+        const dense = this.dense!;
+        const bits = this.bits!;
+
+        for (let i = from; i < to; i++) {
+            const id = data[i];
+            const at = id * 2;
+            let score: number;
+            if (dense[at] !== generation) {
+                dense[at] = generation;
+                dense[at + 1] = score = 1;
+                bits[id >>> 5] |= 1 << (id & 31);
+                this.touch(id);
+            } else {
+                score = ++dense[at + 1];
+            }
+            if (score > maxScore) maxScore = score;
+        }
+
+        return maxScore;
+    }
+
+    /** Score one posting list against the candidates admitted so far. */
+    private scoreDense(from: number, to: number, maxScore: number): number {
+        const data = this.data;
+        const dense = this.dense!;
+        const bits = this.bits!;
+
+        for (let i = from; i < to; i++) {
+            const id = data[i];
+            if ((bits[id >>> 5] & (1 << (id & 31))) === 0) continue;
+            const score = ++dense[id * 2 + 1];
+            if (score > maxScore) maxScore = score;
+        }
+
+        return maxScore;
+    }
+
+    private scoreSparse(from: number, to: number, admit: boolean, maxScore: number): number {
+        const data = this.data;
+        const matches = this.matches!;
+
+        for (let i = from; i < to; i++) {
+            const id = data[i];
+            const current = matches.get(id);
+            if (current === undefined) {
+                if (!admit) continue;
+                this.touch(id);
+                matches.set(id, 1);
+                if (maxScore < 1) maxScore = 1;
+            } else {
+                matches.set(id, current + 1);
+                if (current + 1 > maxScore) maxScore = current + 1;
+            }
+        }
+
+        return maxScore;
+    }
+
+    private clearBits() {
+        const bits = this.bits!;
+        const touched = this.touched;
+        for (let i = 0; i < this.touchedCount; i++) {
+            const id = touched[i];
+            bits[id >>> 5] &= ~(1 << (id & 31));
+        }
+    }
+
     private touch(id: number) {
         if (this.touchedCount === this.touched.length) {
             const grown = new Uint32Array(this.touched.length === 0 ? 64 : this.touched.length * 2);
@@ -668,6 +858,7 @@ export class TrigramIndexReader {
 
         if (max >= 0 && max + 1 <= data.length * 4 + 1024) {
             this.dense = new Int32Array((max + 1) * 2);
+            this.bits = new Uint32Array((max >>> 5) + 1);
         } else {
             this.matches = new Map();
         }
@@ -1279,21 +1470,31 @@ export class PairIndexReader<C extends Columns> {
 
     constructor(
         private lookup: HashLookupReader,
-        columns: C,
-        private views: { [K in keyof C]: ColumnView<C[K]> },
+        spec: C,
+        /** The column views, indexed by what `findIndex` returns. */
+        public readonly columns: { [K in keyof C]: ColumnView<C[K]> },
         private strings: StringReader,
         private readonly layout: PairKeyLayout = PAIR_KEY_LAYOUT,
     ) {
-        this.keys = Object.keys(columns);
-        this.specs = this.keys.map((key) => columns[key]);
+        this.keys = Object.keys(spec);
+        this.specs = this.keys.map((key) => spec[key]);
+    }
+
+    /**
+     * The row `(a, b)` was added as, or `undefined`. `columns.x[row]` then
+     * reads a value without the object `find` builds per hit — which is about
+     * half of what a hit costs on a large index.
+     */
+    findIndex(a: number, b: number): number | undefined {
+        pairKey(a, b, this.layout);
+        return this.lookup.findByHashSplit(hashState.lo, hashState.hi);
     }
 
     find(a: number, b: number): { [K in keyof C]: ColumnReadValue<C[K]> } | undefined {
-        pairKey(a, b, this.layout);
-        const idx = this.lookup.findByHashSplit(hashState.lo, hashState.hi);
+        const idx = this.findIndex(a, b);
         if (idx === undefined) return undefined;
 
-        const views = this.views as Record<string, AnyTypedArray>;
+        const views = this.columns as Record<string, AnyTypedArray>;
         const result: Record<string, unknown> = {};
         for (let i = 0; i < this.keys.length; i++) {
             const key = this.keys[i];

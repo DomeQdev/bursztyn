@@ -115,6 +115,29 @@ stopEntrances: multiBucketArray({
 `stringRefArray` field to re-check the hit against, so a collision returns `undefined` rather than
 the wrong row. Omit it if your keys are known-unique and you would rather not pay the check.
 
+### Reading without allocating
+
+The convenience readers build an object per call; the columns underneath are plain typed arrays and
+cost a single indexed load. On a million-row snapshot the difference is about 15x:
+
+```ts
+departures.get(stop, 1).time;                        // ~200 ns — an object with every column
+departures.time[departures.ptr[stop] + 1];           // ~15 ns — the column, directly
+
+routeStopSeq.find(route, seq)?.arr;                  // ~100 ns — object per hit
+const row = routeStopSeq.findIndex(route, seq);      // ~50 ns — the row index, or undefined
+if (row !== undefined) routeStopSeq.columns.arr[row];
+```
+
+`multiBucketArray` readers expose each column by name plus `ptr`; `pairIndex` readers expose
+`findIndex` and `columns`. Prefer those inside anything that runs per row.
+
+One engine note for the builder side: V8 keeps `push` fast for up to four distinct typed-array
+kinds in one schema and falls off a cliff at the fifth (about 10 ns to 65 ns per push);
+JavaScriptCore degrades gently. If a schema mixes many numeric widths and the build is slow on
+Node, that is why — widening a rarely used `Int8Array` column to one of the kinds already in use
+costs bytes and buys the fast path back.
+
 ## Sharing across threads
 
 ```ts
@@ -474,6 +497,14 @@ openSnapshotFile(schema, path, { migrate, writeBack, shared, log })
 
 readHeader(source) / inspect(source) / isSnapshot(source)
 layoutFromManifest(manifest) / createReadersFromLayout(layout, header)
+
+hashLookup.find(key)                             // → index | undefined
+keyedIndex.find(key)                             // → column view | undefined
+pairIndex.find(a, b) / pairIndex.findIndex(a, b) / pairIndex.columns
+bucketArray.slice(i) / .get(i, j) / .range(i) / .bucketLength(i) / .ptr / .data
+multiBucketArray.<column> / .ptr / .get(i, j)
+sortedU32Index.find(key)
+trigramIndex.search(query, { limit, dynamicCutoffRatio })  // → [{ idx, score }]
 ```
 
 ## License

@@ -45,7 +45,7 @@ const initial = (fields: any): { snapshot: SchemaSnapshot; journal: Journal } =>
         journal: emptyJournal(),
         previous: null,
         out: "./amber",
-        importFrom: "bursztyn",
+        importFrom: "bursztyn-db",
         timestamp: TIMESTAMP,
     });
 
@@ -66,7 +66,7 @@ const generate = (fields: any, renames?: Record<string, string>) => {
         journal,
         previous: snapshot,
         out: "./amber",
-        importFrom: "bursztyn",
+        importFrom: "bursztyn-db",
         renames,
         timestamp: TIMESTAMP,
     });
@@ -133,7 +133,7 @@ describe("planGeneration", () => {
             journal: emptyJournal(),
             previous: null,
             out: "./amber",
-            importFrom: "bursztyn",
+            importFrom: "bursztyn-db",
             timestamp: TIMESTAMP,
         });
 
@@ -217,7 +217,7 @@ describe("planGeneration", () => {
                 journal: emptyJournal(),
                 previous: null,
                 out: "./amber/stops",
-                importFrom: "bursztyn",
+                importFrom: "bursztyn-db",
                 schemaName,
                 timestamp: TIMESTAMP,
             });

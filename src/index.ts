@@ -138,7 +138,7 @@ export {
     TrigramIndexReader,
     type MultiBucketArrayReader,
     type PairKeyLayout,
-} from "./fields.ts";
+} from "./fields/index.ts";
 
 export {
     assertNumericRange,

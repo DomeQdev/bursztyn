@@ -1,6 +1,7 @@
 # AGENTS.md
 
-`bursztyn` — zero-copy columnar snapshots for TypeScript, with generated migrations.
+`bursztyn-db` — zero-copy columnar snapshots for TypeScript, with generated migrations. The package is
+`bursztyn-db`; the CLI command is `bursztyn`.
 
 Two halves. Read the one that matches what you are doing:
 
@@ -254,7 +255,7 @@ Migrations only run **forward**. A snapshot written by a newer build than the on
 | "`--name` and `--rename` apply to one schema" | Add `--only <name>`. |
 | "exports N schemas" | Add `--export <name>`, or give each one an entry in `schemas`. |
 | "Could not import … Node cannot import TypeScript" | Run under Bun or Node >= 22.18, or point `schema` at a `.js` module. |
-| "`./bursztyn` has the same name as the package" | `out` shadows the package for bare specifiers. Rename it; `./amber` is the default. |
+| "`./bursztyn-db` has the same name as the package or its CLI" | `out` shadows the package (`bursztyn-db`) for bare specifiers, or the CLI (`bursztyn`) for `bun bursztyn`. Rename it; `./amber` is the default. |
 
 ### Several schemas
 
@@ -295,13 +296,14 @@ finished.
 ## Working on bursztyn itself
 
 ```
-bun test                  # 106 tests across 6 files
+bun test                  # 122 tests across 13 files
 bun run typecheck         # tsc --noEmit
 bun run build             # tsc -p tsconfig.build.json → dist/
 ```
 
 Zero runtime dependencies, and it stays that way. The library targets Bun, Node 18+, Deno and
-browsers; only `io.ts` and `cli.ts` touch `node:` modules, both behind a dynamic import.
+browsers; only `io.ts` and the CLI (`cli.ts`, `cli/`) touch `node:` modules — `io.ts` behind a
+dynamic import, so the library entry never pulls them in.
 
 ### Where things live
 
@@ -311,9 +313,10 @@ browsers; only `io.ts` and `cli.ts` touch `node:` modules, both behind a dynamic
 | `layout.ts` | `compileSchema` — assigns section ids and computes the schema hash. |
 | `format.ts` | Binary header, section table, manifest, `assembleSnapshot`, `diffManifest`, reader construction. |
 | `builder.ts` | `SnapshotBuilder` — per-field builders, `carry()` for raw sections, `build()`/`buildShared()`. |
-| `fields.ts` | Every field type: builder, reader and `Field` implementation, one after another. |
+| `fields/` | One file per field family — `flat.ts` (`numArray`, `stringRefArray`, `singleStringRef`, `rawBytes`), `hashLookup.ts`, `trigramIndex.ts`, `sortedU32Index.ts`, `bucketArray.ts` (plus `multiBucketArray`), `keyedIndex.ts`, `pairIndex.ts` — each holding its builder, reader and `Field`. `fields/index.ts` re-exports them. |
 | `columns.ts` | Column specs (`u8()` … `stringRef()`) shared by the bucket and index families. |
 | `strings.ts` | `StringInterner` (write), `StringReader` (read), `stringTable()`. |
+| `utf8.ts` | Byte-level helpers the string table dedupes and verifies with, without decoding anything. |
 | `registry.ts` | `fieldFromSignature` — signature string to field instance. How a snapshot is read without its schema. |
 | `schema.ts` | `defineSchema`, the three import-time refusals, `read` / `open` / `migrate`. |
 | `migrate.ts` | Chain resolution, per-step auto-carry, and the guardrails (`CarryConflictError`, the data-loss check). |
@@ -321,7 +324,8 @@ browsers; only `io.ts` and `cli.ts` touch `node:` modules, both behind a dynamic
 | `generate.ts` | Pure planning: diff → `SchemaChange` → the text of every generated file. |
 | `journal.ts` | Journal and per-version snapshot shapes, and the paths they live at. |
 | `config.ts` | `bursztyn.config.json` → targets, including name derivation and collision checks. |
-| `cli.ts` | Argument parsing, schema loading, the Bun re-exec, and all terminal output. |
+| `cli.ts` | The bin entry: usage text and command dispatch. |
+| `cli/` | `terminal.ts` (argv, colours, output), `load.ts` (config, schema module, the Bun re-exec, journal), and one file per command: `generate.ts`, `status.ts`, `inspect.ts`. |
 | `io.ts` | File helpers, including the unzeroed-buffer read and the header-only read. |
 
 ### Compatibility contract
@@ -339,14 +343,15 @@ The binary layout itself is versioned by `FORMAT_VERSION` in `format.ts`.
 
 ### Adding a field type
 
-1. Implement builder, reader and `Field` in `fields.ts`, next to its closest relative. `signature()`
-   must encode everything that affects the layout.
+1. Implement builder, reader and `Field` in a file under `fields/`, next to its closest relative, and
+   re-export it from `fields/index.ts`. `signature()` must encode everything that affects the layout.
 2. Register the signature in `registry.ts` so snapshots can be read without a schema — migrations
    depend on this.
 3. Teach `renderField` in `generate.ts` to emit a constructor call for it, or generated migrations
    fall back to `fieldFromSignature("…")` — which works, but reads badly in a file a human has to edit.
 4. Export it from `index.ts`.
-5. Test the round trip in `fields.test.ts`, and a carry through a migration in `migrate.test.ts`.
+5. Test the round trip in a `fields/<name>.test.ts` beside it, and a carry through a migration in
+   `migrate.test.ts`.
 
 ### Conventions
 

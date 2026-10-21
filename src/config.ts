@@ -2,12 +2,12 @@ import { extname, resolve } from "node:path";
 import { BursztynError } from "./errors.ts";
 
 /**
- * Deliberately not "./bursztyn": a folder named after the package shadows it
- * for bare specifiers, so the schema's own `from "bursztyn"` can land on the
+ * Deliberately not "./bursztyn-db": a folder named after the package shadows it
+ * for bare specifiers, so the schema's own `from "bursztyn-db"` can land on the
  * migrations folder.
  */
 export const DEFAULT_OUT = "./amber";
-export const DEFAULT_IMPORT_FROM = "bursztyn";
+export const DEFAULT_IMPORT_FROM = "bursztyn-db";
 
 export interface TargetInput {
     /** Module that exports the schema. */
@@ -18,7 +18,7 @@ export interface TargetInput {
     name?: string;
     /** Which export to take, when one module holds more than one schema. */
     export?: string;
-    /** Specifier the generated files import from. Defaults to `"bursztyn"`. */
+    /** Specifier the generated files import from. Defaults to `"bursztyn-db"`. */
     importFrom?: string;
 }
 

@@ -13,7 +13,7 @@ import {
     sortedU32Index,
     stringRefArray,
     trigramIndex,
-} from "./fields.ts";
+} from "./fields/index.ts";
 import { stringTable } from "./strings.ts";
 import type { Field, TypedArrayConstructor } from "./types.ts";
 
